@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ project.title }}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>{{ project.subtitle }}</h1>
+    <p>{{ project.title }}</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>Mục tiêu đề tài</h2>
+      <ul>
+        {% for item in project.objectives %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section>
+      <h2>Quy trình thực hiện</h2>
+      <div class="timeline">
+        {% for step in workflow.steps %}
+        <article class="card">
+          <h3>Bước {{ loop.index }}: {{ step.name }}</h3>
+          <p>{{ step.detail }}</p>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section>
+      <h2>Cống hiến mới của đề tài</h2>
+      <ul>
+        {% for item in novelty.contributions %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+      <p><strong>Bộ dữ liệu đánh giá:</strong> {{ novelty.target_datasets | join(', ') }}</p>
+    </section>
+
+    <section>
+      <h2>Công nghệ sử dụng</h2>
+      <div class="tags">
+        {% for stack in project.stacks %}
+        <span>{{ stack }}</span>
+        {% endfor %}
+      </div>
+    </section>
+  </main>
+</body>
+</html>

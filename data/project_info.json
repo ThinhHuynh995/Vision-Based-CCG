@@ -1,0 +1,10 @@
+{
+  "title": "Vision-Based Abnormal Behavior Detection and People Flow Analysis in Public Spaces",
+  "subtitle": "Khung DCAD (Density-Conditioned Anomaly Detection) với Crowd Context Gate",
+  "objectives": [
+    "Xây dựng pipeline giám sát tự động cho trung tâm thương mại và trung tâm hành chính.",
+    "Kết hợp ước lượng mật độ đám đông và phát hiện bất thường theo ngữ cảnh thời gian thực.",
+    "Giảm cảnh báo giả trong bối cảnh mật độ cao bằng cơ chế điều chỉnh ngưỡng động CCG."
+  ],
+  "stacks": ["FastAPI", "OpenCV", "PyTorch", "CSRNet (pretrained)", "Jinja2 Templates", "JSON Data"]
+}
