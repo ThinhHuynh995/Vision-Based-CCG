@@ -1,0 +1,9 @@
+{
+  "contributions": [
+    "Đề xuất DCAD: mô hình hợp nhất density estimation và anomaly detection trong một luồng xử lý chung.",
+    "Thiết kế Crowd Context Gate (CCG) để điều chỉnh ngưỡng phát hiện bất thường theo mật độ đám đông thời gian thực.",
+    "Giảm false positive trong khung cảnh đông người nhờ cơ chế ngưỡng động thay vì ngưỡng tĩnh truyền thống.",
+    "Kiến trúc triển khai web trực quan bằng tiếng Việt, tách dữ liệu JSON giúp dễ mở rộng báo cáo và dashboard."
+  ],
+  "target_datasets": ["UCF-Crime", "ShanghaiTech Campus", "Mall Dataset"]
+}
