@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="vi">
 <head>
   <meta charset="utf-8" />
@@ -14,7 +14,64 @@
 
   <main>
     <section>
-      <h2>Mục tiêu đề tài</h2>
+      <h2>Demo tuong tac</h2>
+      <p>Chon 1 trong 3 cach: upload anh, upload video, hoac webcam/camera truc tiep.</p>
+
+      <div class="demo-grid">
+        <article class="panel">
+          <h3>1) Upload anh</h3>
+          <input id="imageInput" type="file" accept="image/*" />
+          <button id="btnAnalyzeImage" type="button">Phan tich anh</button>
+          <img id="imagePreview" alt="Image preview" />
+        </article>
+
+        <article class="panel">
+          <h3>2) Upload video</h3>
+          <input id="videoInput" type="file" accept="video/*" />
+          <button id="btnAnalyzeVideo" type="button">Phan tich video</button>
+          <video id="videoPreview" controls muted playsinline></video>
+        </article>
+
+        <article class="panel">
+          <h3>3) Webcam / Camera</h3>
+          <div class="camera-actions">
+            <button id="btnStartCamera" type="button">Bat camera</button>
+            <button id="btnStopCamera" type="button">Dung camera</button>
+          </div>
+          <video id="cameraPreview" autoplay muted playsinline></video>
+        </article>
+      </div>
+
+      <canvas id="captureCanvas"></canvas>
+
+      <div class="result-box" id="resultBox">
+        <h3>Ket qua</h3>
+        <p id="resultStatus">Dang cho du lieu...</p>
+        <img id="resultFrame" alt="Annotated result frame" />
+        <div class="result-grid">
+          <div><span>Source:</span> <strong id="rSource">-</strong></div>
+          <div><span>Frames:</span> <strong id="rFrames">-</strong></div>
+          <div><span>Intensity:</span> <strong id="rIntensity">-</strong></div>
+          <div><span>Motion:</span> <strong id="rMotion">-</strong></div>
+          <div><span>Crowd:</span> <strong id="rCrowd">-</strong></div>
+          <div><span>Anomaly:</span> <strong id="rAnomaly">-</strong></div>
+          <div><span>Behavior:</span> <strong id="rBehavior">-</strong></div>
+          <div><span>Objects:</span> <strong id="rObjects">-</strong></div>
+        </div>
+        <div id="objectTags" class="object-tags"></div>
+        <div class="step-metrics">
+          <h4>So lieu theo tung buoc</h4>
+          <div id="stepMetrics"></div>
+        </div>
+        <div class="step-metrics">
+          <h4>Video Time Series</h4>
+          <div id="timeSeries"></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Muc tieu de tai</h2>
       <ul>
         {% for item in project.objectives %}
         <li>{{ item }}</li>
@@ -23,11 +80,11 @@
     </section>
 
     <section>
-      <h2>Quy trình thực hiện</h2>
+      <h2>Quy trinh thuc hien</h2>
       <div class="timeline">
         {% for step in workflow.steps %}
         <article class="card">
-          <h3>Bước {{ loop.index }}: {{ step.name }}</h3>
+          <h3>Buoc {{ loop.index }}: {{ step.name }}</h3>
           <p>{{ step.detail }}</p>
         </article>
         {% endfor %}
@@ -35,17 +92,17 @@
     </section>
 
     <section>
-      <h2>Cống hiến mới của đề tài</h2>
+      <h2>Cong hien moi cua de tai</h2>
       <ul>
         {% for item in novelty.contributions %}
         <li>{{ item }}</li>
         {% endfor %}
       </ul>
-      <p><strong>Bộ dữ liệu đánh giá:</strong> {{ novelty.target_datasets | join(', ') }}</p>
+      <p><strong>Bo du lieu danh gia:</strong> {{ novelty.target_datasets | join(', ') }}</p>
     </section>
 
     <section>
-      <h2>Công nghệ sử dụng</h2>
+      <h2>Cong nghe su dung</h2>
       <div class="tags">
         {% for stack in project.stacks %}
         <span>{{ stack }}</span>
@@ -53,5 +110,180 @@
       </div>
     </section>
   </main>
+
+  <script>
+    const imageInput = document.getElementById('imageInput');
+    const videoInput = document.getElementById('videoInput');
+    const imagePreview = document.getElementById('imagePreview');
+    const videoPreview = document.getElementById('videoPreview');
+    const cameraPreview = document.getElementById('cameraPreview');
+    const captureCanvas = document.getElementById('captureCanvas');
+
+    const rSource = document.getElementById('rSource');
+    const rFrames = document.getElementById('rFrames');
+    const rIntensity = document.getElementById('rIntensity');
+    const rMotion = document.getElementById('rMotion');
+    const rCrowd = document.getElementById('rCrowd');
+    const rAnomaly = document.getElementById('rAnomaly');
+    const rBehavior = document.getElementById('rBehavior');
+    const rObjects = document.getElementById('rObjects');
+    const resultStatus = document.getElementById('resultStatus');
+    const resultFrame = document.getElementById('resultFrame');
+    const objectTags = document.getElementById('objectTags');
+    const stepMetrics = document.getElementById('stepMetrics');
+    const timeSeries = document.getElementById('timeSeries');
+
+    let cameraStream = null;
+    let cameraTimer = null;
+    const clientId = localStorage.getItem('dcad_client_id') || crypto.randomUUID();
+    localStorage.setItem('dcad_client_id', clientId);
+
+    function setStatus(text) {
+      resultStatus.textContent = text;
+    }
+
+    function showResult(data) {
+      rSource.textContent = data.source_type;
+      rFrames.textContent = data.frames;
+      rIntensity.textContent = Number(data.avg_intensity).toFixed(3);
+      rMotion.textContent = Number(data.avg_motion).toFixed(3);
+      rCrowd.textContent = data.crowd_level;
+      rAnomaly.textContent = `${data.anomaly_label} (${(Number(data.anomaly_score) * 100).toFixed(1)}%)`;
+      rBehavior.textContent = data.behavior_label || '-';
+      rObjects.textContent = Number(data.detected_objects || 0);
+      if (data.annotated_frame_data_url) {
+        resultFrame.src = data.annotated_frame_data_url;
+        resultFrame.style.display = 'block';
+      }
+      objectTags.innerHTML = '';
+      (data.objects || []).forEach((obj) => {
+        const tag = document.createElement('span');
+        tag.textContent = `${obj.label} #${obj.id}`;
+        objectTags.appendChild(tag);
+      });
+
+      stepMetrics.innerHTML = '';
+      (data.step_metrics || []).forEach((item) => {
+        const row = document.createElement('div');
+        row.className = 'step-row';
+        const title = document.createElement('div');
+        title.className = 'step-title';
+        title.textContent = item.step;
+        const body = document.createElement('div');
+        body.className = 'step-body';
+        body.textContent = Object.entries(item.metrics || {})
+          .map(([k, v]) => `${k}: ${v}`)
+          .join(' | ');
+        row.appendChild(title);
+        row.appendChild(body);
+        stepMetrics.appendChild(row);
+      });
+
+      timeSeries.innerHTML = '';
+      (data.time_series || []).slice(0, 200).forEach((pt) => {
+        const row = document.createElement('div');
+        row.className = 'step-row';
+        row.innerHTML = `<div class="step-title">frame=${pt.frame_index} | t=${pt.t_sec}s</div>
+          <div class="step-body">motion: ${pt.motion} | intensity: ${pt.mean_intensity} | objects: ${pt.object_count} | behavior: ${pt.behavior_label}</div>`;
+        timeSeries.appendChild(row);
+      });
+      setStatus('Da cap nhat ket qua');
+    }
+
+    async function postFile(url, file) {
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await fetch(url, { method: 'POST', body: formData });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Request failed');
+      }
+      return response.json();
+    }
+
+    imageInput.addEventListener('change', () => {
+      const file = imageInput.files?.[0];
+      if (!file) return;
+      imagePreview.src = URL.createObjectURL(file);
+      imagePreview.style.display = 'block';
+    });
+
+    videoInput.addEventListener('change', () => {
+      const file = videoInput.files?.[0];
+      if (!file) return;
+      videoPreview.src = URL.createObjectURL(file);
+      videoPreview.style.display = 'block';
+    });
+
+    document.getElementById('btnAnalyzeImage').addEventListener('click', async () => {
+      const file = imageInput.files?.[0];
+      if (!file) return setStatus('Hay chon file anh truoc');
+      try {
+        setStatus('Dang phan tich anh...');
+        const data = await postFile('/api/analyze/upload-image', file);
+        showResult(data);
+      } catch (error) {
+        setStatus(`Loi: ${error.message}`);
+      }
+    });
+
+    document.getElementById('btnAnalyzeVideo').addEventListener('click', async () => {
+      const file = videoInput.files?.[0];
+      if (!file) return setStatus('Hay chon file video truoc');
+      try {
+        setStatus('Dang phan tich video...');
+        const data = await postFile('/api/analyze/upload-video', file);
+        showResult(data);
+      } catch (error) {
+        setStatus(`Loi: ${error.message}`);
+      }
+    });
+
+    async function sendWebcamFrame() {
+      if (!cameraStream) return;
+      captureCanvas.width = cameraPreview.videoWidth;
+      captureCanvas.height = cameraPreview.videoHeight;
+      const ctx = captureCanvas.getContext('2d');
+      ctx.drawImage(cameraPreview, 0, 0, captureCanvas.width, captureCanvas.height);
+      const frameData = captureCanvas.toDataURL('image/jpeg', 0.7);
+
+      try {
+        const response = await fetch('/api/analyze/webcam-frame', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ client_id: clientId, frame_data_url: frameData }),
+        });
+        if (!response.ok) return;
+        const data = await response.json();
+        showResult(data);
+      } catch (_) {
+      }
+    }
+
+    document.getElementById('btnStartCamera').addEventListener('click', async () => {
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        cameraPreview.srcObject = cameraStream;
+        setStatus('Camera dang chay');
+        if (cameraTimer) clearInterval(cameraTimer);
+        cameraTimer = setInterval(sendWebcamFrame, 500);
+      } catch (error) {
+        setStatus(`Khong mo duoc camera: ${error.message}`);
+      }
+    });
+
+    document.getElementById('btnStopCamera').addEventListener('click', () => {
+      if (cameraTimer) {
+        clearInterval(cameraTimer);
+        cameraTimer = null;
+      }
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+        cameraStream = null;
+      }
+      cameraPreview.srcObject = null;
+      setStatus('Camera da dung');
+    });
+  </script>
 </body>
 </html>
