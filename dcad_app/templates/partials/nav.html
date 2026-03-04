@@ -1,0 +1,12 @@
+<nav class="navbar">
+  <div class="brand">👁 <span>DCAD·System</span></div>
+  <div class="links">
+    <a href="/" class="{% if request.url.path=='/' %}active{% endif %}">🏠 <span>Trang chủ</span></a>
+    <a href="/pipeline" class="{% if request.url.path=='/pipeline' %}active{% endif %}">🔬 <span>Pipeline</span></a>
+    <a href="/history" class="{% if request.url.path=='/history' %}active{% endif %}">📋 <span>Lịch sử</span></a>
+    <a href="/training" class="{% if request.url.path=='/training' %}active{% endif %}">🏋️ <span>Training</span></a>
+    <a href="/about" class="{% if request.url.path=='/about' %}active{% endif %}">📖 <span>Giới thiệu</span></a>
+  </div>
+  <div class="api-status"><span class="dot"></span>API Online</div>
+  <div class="model-status">{{ model_status.label }}</div>
+</nav>
