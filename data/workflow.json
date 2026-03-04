@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "name": "Input (Ảnh/Video)",
+      "detail": "Nạp luồng camera hoặc video lưu trữ từ khu vực công cộng."
+    },
+    {
+      "name": "Tăng cường dữ liệu",
+      "detail": "Augmentation gồm biến đổi hình học, ánh sáng và blur/noise để tăng tính tổng quát."
+    },
+    {
+      "name": "Tiền xử lý (1)",
+      "detail": "Khử nhiễu, cân bằng sáng, ổn định frame bằng OpenCV."
+    },
+    {
+      "name": "Tiền xử lý (2)",
+      "detail": "Tách đối tượng/chuyển động và trích xuất đặc trưng không gian-thời gian."
+    },
+    {
+      "name": "Training & Inference",
+      "detail": "CSRNet ước lượng mật độ đám đông, module DCAD + CCG dự đoán bất thường theo ngưỡng động."
+    },
+    {
+      "name": "Output",
+      "detail": "Dashboard hiển thị heatmap mật độ, điểm bất thường, cảnh báo và thống kê dòng người."
+    }
+  ]
+}
