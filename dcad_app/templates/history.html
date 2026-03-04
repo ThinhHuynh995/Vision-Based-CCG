@@ -1,7 +1,0 @@
-<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lịch sử</title><link rel="stylesheet" href="/static/css/main.css"></head><body>
-{% include 'partials/nav.html' %}
-<main class="panel page"><h1>Lịch sử phân tích</h1>
-{% if all_history %}<table class="history-table"><tr><th>Thumbnail</th><th>File</th><th>Thời gian</th><th>Người</th><th>Mật độ</th><th>Score</th><th>Phân loại</th><th>Trạng thái</th><th>Hành động</th></tr>
-{% for i in all_history %}<tr class="{% if i.alert %}row-alert{% endif %}"><td><img src="{{ i.result_img or '' }}"></td><td>{{ i.filename }}</td><td>{{ i.timestamp }}</td><td>{{ i.person_count }}</td><td>{{ i.density_level }}</td><td><div class="scorebar"><span style="width:{{ (i.anomaly_score*100)|int }}%"></span></div>{{ i.anomaly_score }}</td><td>{{ i.anomaly_class }}</td><td>{% if i.alert %}⚠{% else %}✓{% endif %}</td><td><button onclick="deleteHistory('{{ i.job_id }}')">Xoá</button></td></tr>{% endfor %}</table>
-{% else %}<p>Chưa có dữ liệu lịch sử.</p>{% endif %}
-</main>{% include 'partials/footer.html' %}<script src="/static/js/main.js"></script></body></html>
