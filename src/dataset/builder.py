@@ -1,445 +1,463 @@
 """
-src/dataset/builder.py — Dataset Builder & Validator
-=====================================================
-Chuyển đổi ảnh đã gán nhãn thành cấu trúc train/val/test
-sẵn sàng cho PyTorch DataLoader.
+src/dataset/builder.py — Dataset Builder Pipeline
+===================================================
+
+Converts raw CCTV footage + label files into a clean, balanced
+train/val/test split ready for training.
 
 Pipeline:
-    1. Collect  – Quét toàn bộ ảnh từ data/labeled/
-    2. Dedup    – Loại bỏ ảnh trùng (MD5)
-    3. Balance  – Oversample class thiếu (tùy chọn)
-    4. Split    – Phân chia stratified train/val/test
-    5. Write    – Copy ảnh vào data/processed/{split}/{class}/
-    6. Validate – Kiểm tra toàn bộ dataset sau khi build
+    1. Ingest: scan raw video folder + label JSON files
+    2. Extract: pull labeled frames from videos → crop person ROIs
+    3. Balance: oversample minority classes to target ratio
+    4. Split:   stratified train/val/test split
+    5. Verify:  sanity checks + class distribution report
 
-Sử dụng:
+Usage:
     from src.dataset.builder import DatasetBuilder
     builder = DatasetBuilder(cfg)
-    stats = builder.build("data/labeled", "data/processed")
-    stats.print()
-
-    # Validate riêng:
-    from src.dataset.builder import validate
-    report = validate("data/processed")
-    report.print()
+    stats = builder.build(
+        labeled_dir="data/labeled",
+        output_dir="data/processed",
+    )
 """
 from __future__ import annotations
 import cv2
-import hashlib
 import json
-import random
 import shutil
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+import random
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import src.utils.log as _log
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+from collections import Counter, defaultdict
 
-log = _log.get(__name__)
+from src.utils.logger import get_logger
 
-CLASS_NAMES = {0:"Normal", 1:"Fighting", 2:"Falling", 3:"Loitering", 4:"Crowd Panic"}
-CLASS_IDX   = {v: k for k, v in CLASS_NAMES.items()}
-SPLITS      = ("train", "val", "test")
+logger = get_logger(__name__)
 
+CLASS_NAMES = {
+    0: "Normal",
+    1: "Fighting",
+    2: "Falling",
+    3: "Loitering",
+    4: "Crowd Panic",
+}
 
-# ── Data Models ───────────────────────────────────────────────────────────────
 
 @dataclass
 class Sample:
-    path:       Path
-    class_id:   int
+    """Single labeled image sample."""
+    path: Path
+    class_id: int
     class_name: str
+    source_video: str = ""
+    frame_idx: int = 0
 
     @property
-    def md5(self) -> str:
+    def checksum(self) -> str:
+        """MD5 of file for deduplication."""
         with open(self.path, "rb") as f:
             return hashlib.md5(f.read()).hexdigest()
 
 
 @dataclass
-class BuildStats:
-    total:          int = 0
-    train:          int = 0
-    val:            int = 0
-    test:           int = 0
-    duplicates_rm:  int = 0
-    class_dist:     Dict[str, int] = field(default_factory=dict)
-    train_dist:     Dict[str, int] = field(default_factory=dict)
-    val_dist:       Dict[str, int] = field(default_factory=dict)
-    test_dist:      Dict[str, int] = field(default_factory=dict)
-    output_dir:     str = ""
+class DatasetStats:
+    """Summary statistics for a built dataset."""
+    total_samples: int = 0
+    train_count: int = 0
+    val_count: int = 0
+    test_count: int = 0
+    class_distribution: Dict[str, int] = field(default_factory=dict)
+    train_dist: Dict[str, int] = field(default_factory=dict)
+    val_dist: Dict[str, int] = field(default_factory=dict)
+    test_dist: Dict[str, int] = field(default_factory=dict)
+    duplicate_removed: int = 0
+    output_dir: str = ""
 
     def print(self):
-        print("\n" + "═"*55)
+        print("\n" + "═" * 55)
         print("  DATASET BUILD SUMMARY")
-        print("═"*55)
-        print(f"  Tổng mẫu       : {self.total}")
-        print(f"  Train          : {self.train}")
-        print(f"  Val            : {self.val}")
-        print(f"  Test           : {self.test}")
-        print(f"  Ảnh trùng xóa : {self.duplicates_rm}")
-        print(f"\n  Phân phối Train:")
+        print("═" * 55)
+        print(f"  Total samples : {self.total_samples}")
+        print(f"  Train         : {self.train_count}")
+        print(f"  Val           : {self.val_count}")
+        print(f"  Test          : {self.test_count}")
+        print(f"  Duplicates rm : {self.duplicate_removed}")
+        print()
+        print("  Class distribution (train):")
         for cls, n in sorted(self.train_dist.items()):
-            bar = "█" * min(n//2, 30)
-            print(f"    {cls:<14} {bar:<30} {n:4d}")
+            bar = "█" * min(n // 2, 30)
+            print(f"    {cls:<14} {bar:30s} {n}")
         print(f"\n  Output → {self.output_dir}")
-        print("═"*55 + "\n")
+        print("═" * 55 + "\n")
 
-
-@dataclass
-class ValidationReport:
-    passed:   bool = True
-    errors:   List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    counts:   Dict[str, Dict[str,int]] = field(default_factory=dict)
-
-    def error(self, msg: str):
-        self.errors.append(msg); self.passed = False
-        log.error(msg)
-
-    def warn(self, msg: str):
-        self.warnings.append(msg)
-        log.warning(msg)
-
-    def print(self):
-        status = "✅ PASSED" if self.passed else "❌ FAILED"
-        print("\n" + "═"*55)
-        print(f"  VALIDATION  {status}")
-        print("═"*55)
-        for split, dist in self.counts.items():
-            total = sum(dist.values())
-            print(f"\n  {split.upper()} ({total} ảnh):")
-            for cls, n in sorted(dist.items()):
-                bar = "█" * min(n//2, 28)
-                print(f"    {cls:<14} {bar:<28} {n:4d}")
-        if self.warnings:
-            print(f"\n  ⚠  {len(self.warnings)} cảnh báo:")
-            for w in self.warnings: print(f"    - {w}")
-        if self.errors:
-            print(f"\n  ✗  {len(self.errors)} lỗi:")
-            for e in self.errors: print(f"    - {e}")
-        print("═"*55 + "\n")
-
-
-# ── Builder ───────────────────────────────────────────────────────────────────
 
 class DatasetBuilder:
     """
-    Build dataset từ thư mục ảnh gán nhãn.
+    End-to-end dataset builder for CCTV behavior classification.
 
-    Cấu trúc nguồn chấp nhận:
-        data/labeled/
-            Normal/       img.jpg ...
-            Fighting/     ...
-        HOẶC
-        data/labeled/
-            video1/
-                Normal/   ...
-            video2/
-                Fighting/ ...
+    Args:
+        cfg: project config dict (from config.yaml)
     """
 
-    def __init__(self, cfg=None):
-        self._seed = int(cfg.seed if cfg and cfg.seed else 42)
-        random.seed(self._seed)
+    def __init__(self, cfg: dict):
+        self.cfg       = cfg
+        self.seed      = cfg.get("seed", 42)
+        random.seed(self.seed)
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def build(
         self,
-        labeled_dir:      str = "data/labeled",
-        output_dir:       str = "data/processed",
-        val_ratio:        float = 0.15,
-        test_ratio:       float = 0.10,
+        labeled_dir: str = "data/labeled",
+        output_dir: str  = "data/processed",
+        val_ratio: float   = 0.15,
+        test_ratio: float  = 0.10,
         target_per_class: Optional[int] = None,
         remove_duplicates: bool = True,
-        min_size:         Tuple[int,int] = (32, 32),
-    ) -> BuildStats:
+        min_size: Tuple[int, int] = (32, 32),
+    ) -> DatasetStats:
         """
-        Chạy toàn bộ pipeline build.
+        Run the full build pipeline.
 
         Args:
-            labeled_dir:       thư mục gốc chứa ảnh gán nhãn
-            output_dir:        thư mục output (data/processed)
-            val_ratio:         tỉ lệ validation (0–1)
-            test_ratio:        tỉ lệ test (0–1)
-            target_per_class:  oversample lên N mẫu/class (None = không oversample)
-            remove_duplicates: loại bỏ ảnh trùng theo MD5
-            min_size:          bỏ ảnh nhỏ hơn (w, h)
+            labeled_dir:       root with labeled/<video_stem>/{class}/frames
+            output_dir:        root for processed/train|val|test/<class>/
+            val_ratio:         fraction for validation set
+            test_ratio:        fraction for test set
+            target_per_class:  oversample to this count (None = no balancing)
+            remove_duplicates: skip identical images (MD5 hash)
+            min_size:          (w, h) minimum crop size to include
 
         Returns:
-            BuildStats
+            DatasetStats object
         """
-        log.info("=== DatasetBuilder: bắt đầu ===")
+        logger.info("=== DatasetBuilder: starting pipeline ===")
+        labeled_root = Path(labeled_dir)
+        out_root     = Path(output_dir)
 
-        # 1. Thu thập
-        samples = self._collect(Path(labeled_dir), min_size)
-        log.info(f"Thu thập: {len(samples)} mẫu")
+        # ── Step 1: Collect all samples ───────────────────────────────────
+        samples = self._collect_samples(labeled_root, min_size)
+        logger.info(f"Collected {len(samples)} raw samples")
 
-        # 2. Dedup
+        # ── Step 2: Remove duplicates ─────────────────────────────────────
         n_before = len(samples)
         if remove_duplicates:
-            samples = self._dedup(samples)
-        dup_rm = n_before - len(samples)
-        if dup_rm:
-            log.info(f"Đã xóa {dup_rm} ảnh trùng")
+            samples = self._deduplicate(samples)
+        dup_removed = n_before - len(samples)
+        logger.info(f"After dedup: {len(samples)} samples ({dup_removed} removed)")
 
-        # 3. Balance
+        # ── Step 3: Balance classes ───────────────────────────────────────
         if target_per_class:
-            samples = self._balance(samples, target_per_class)
-            log.info(f"Sau balance: {len(samples)} mẫu")
+            samples = self._balance(samples, target_per_class, labeled_root)
+            logger.info(f"After balancing: {len(samples)} samples")
 
-        # 4. Split
-        splits = self._split(samples, val_ratio, test_ratio)
+        # ── Step 4: Stratified split ──────────────────────────────────────
+        splits = self._stratified_split(samples, val_ratio, test_ratio)
 
-        # 5. Write
-        self._write(splits, Path(output_dir))
+        # ── Step 5: Write to disk ─────────────────────────────────────────
+        self._write_split(splits, out_root)
 
-        # 6. Stats
-        stats = BuildStats(
-            total         = len(samples),
-            train         = len(splits["train"]),
-            val           = len(splits["val"]),
-            test          = len(splits["test"]),
-            duplicates_rm = dup_rm,
-            class_dist    = self._dist(samples),
-            train_dist    = self._dist(splits["train"]),
-            val_dist      = self._dist(splits["val"]),
-            test_dist     = self._dist(splits["test"]),
-            output_dir    = output_dir,
-        )
+        # ── Step 6: Compute stats ─────────────────────────────────────────
+        stats = self._compute_stats(splits, dup_removed, str(out_root))
         stats.print()
-
-        # Ghi manifest
-        self._write_manifest(splits, Path(output_dir))
+        self._write_manifest(splits, out_root)
         return stats
 
-    # ── Private ───────────────────────────────────────────────────────────────
+    def extract_frames_from_video(
+        self,
+        video_path: str,
+        label_json: str,
+        output_dir: str,
+        crop_persons: bool = True,
+    ) -> int:
+        """
+        Extract labeled frames from a video using a label JSON file.
 
-    def _collect(self, root: Path, min_size: Tuple[int,int]) -> List[Sample]:
+        label_json format: {"frame_idx": label_id, ...}
+        Optionally runs HOG person detection to extract tight crops.
+
+        Returns number of frames extracted.
+        """
+        from src.detection.detector import PersonDetector
+
+        video_path = Path(video_path)
+        out_root   = Path(output_dir)
+        with open(label_json) as f:
+            label_data = {int(k): v for k, v in json.load(f).items()}
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.error(f"Cannot open: {video_path}")
+            return 0
+
+        det = PersonDetector(self.cfg.get("detection", {})) if crop_persons else None
+        count = 0
+
+        for frame_idx, label_id in sorted(label_data.items()):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            cls_name = CLASS_NAMES.get(label_id, "Normal")
+            save_dir = out_root / cls_name
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            if crop_persons and det:
+                dets = det.detect(frame)
+                if dets:
+                    for i, d in enumerate(dets[:3]):   # max 3 persons per frame
+                        x1, y1, x2, y2 = d.bbox
+                        crop = frame[max(0,y1):y2, max(0,x1):x2]
+                        if crop.size > 0:
+                            fname = f"{video_path.stem}_f{frame_idx:06d}_p{i}.jpg"
+                            cv2.imwrite(str(save_dir / fname), crop)
+                            count += 1
+                else:
+                    # No detection → save full frame
+                    fname = f"{video_path.stem}_f{frame_idx:06d}.jpg"
+                    cv2.imwrite(str(save_dir / fname), frame)
+                    count += 1
+            else:
+                fname = f"{video_path.stem}_f{frame_idx:06d}.jpg"
+                cv2.imwrite(str(save_dir / fname), frame)
+                count += 1
+
+        cap.release()
+        logger.info(f"Extracted {count} frames from {video_path.name}")
+        return count
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _collect_samples(
+        self, root: Path, min_size: Tuple[int, int]
+    ) -> List[Sample]:
         exts = {".jpg", ".jpeg", ".png", ".bmp"}
         samples = []
-        for cls_name, cls_id in CLASS_IDX.items():
-            # Flat: root/ClassName/
-            dirs = list(root.glob(cls_name))
-            # Nested: root/*/ClassName/
-            dirs += list(root.glob(f"*/{cls_name}"))
-            for d in dirs:
-                if not d.is_dir(): continue
+        for cls_id, cls_name in CLASS_NAMES.items():
+            cls_dir = root / cls_name
+            if not cls_dir.exists():
+                # Also scan nested labeled/<video>/ClassName/
+                nested = list(root.glob(f"*/{cls_name}"))
+                dirs_to_scan = nested
+            else:
+                dirs_to_scan = [cls_dir]
+            for d in dirs_to_scan:
                 for p in d.iterdir():
-                    if p.suffix.lower() not in exts: continue
+                    if p.suffix.lower() not in exts:
+                        continue
                     img = cv2.imread(str(p))
-                    if img is None: continue
+                    if img is None:
+                        continue
                     h, w = img.shape[:2]
-                    if w < min_size[0] or h < min_size[1]: continue
-                    samples.append(Sample(path=p, class_id=cls_id, class_name=cls_name))
-        if not samples:
-            log.warning(
-                f"Không tìm thấy ảnh trong {root}.\n"
-                f"  Cấu trúc mong đợi: {root}/{{Normal,Fighting,...}}/img.jpg\n"
-                f"  Hoặc: {root}/video1/{{Normal,...}}/img.jpg"
-            )
+                    if w < min_size[0] or h < min_size[1]:
+                        continue
+                    samples.append(Sample(
+                        path=p, class_id=cls_id, class_name=cls_name
+                    ))
         return samples
 
-    def _dedup(self, samples: List[Sample]) -> List[Sample]:
-        seen, out = set(), []
+    def _deduplicate(self, samples: List[Sample]) -> List[Sample]:
+        seen, unique = set(), []
         for s in samples:
-            h = s.md5
-            if h not in seen:
-                seen.add(h); out.append(s)
-        return out
+            cs = s.checksum
+            if cs not in seen:
+                seen.add(cs)
+                unique.append(s)
+        return unique
 
-    def _balance(self, samples: List[Sample], target: int) -> List[Sample]:
-        by_cls: Dict[int, List[Sample]] = defaultdict(list)
+    def _balance(
+        self, samples: List[Sample], target: int, labeled_root: Path
+    ) -> List[Sample]:
+        """Oversample minority classes by duplicating (no augmentation here)."""
+        by_class: Dict[int, List[Sample]] = defaultdict(list)
         for s in samples:
-            by_cls[s.class_id].append(s)
-        out = []
-        for cls_id in CLASS_IDX.values():
-            cls_s = by_cls.get(cls_id, [])
-            if not cls_s:
-                log.warning(f"Không có mẫu cho class {CLASS_NAMES[cls_id]}")
+            by_class[s.class_id].append(s)
+
+        balanced = []
+        for cls_id in CLASS_NAMES:
+            cls_samples = by_class.get(cls_id, [])
+            if not cls_samples:
+                logger.warning(f"No samples for class {CLASS_NAMES[cls_id]}")
                 continue
-            if len(cls_s) >= target:
-                out.extend(random.sample(cls_s, target))
+            if len(cls_samples) >= target:
+                balanced.extend(random.sample(cls_samples, target))
             else:
-                extra = random.choices(cls_s, k=target - len(cls_s))
-                out.extend(cls_s + extra)
-        return out
+                # Duplicate with replacement
+                extra = random.choices(cls_samples, k=target - len(cls_samples))
+                balanced.extend(cls_samples + extra)
+        return balanced
 
-    def _split(
-        self, samples: List[Sample], val_r: float, test_r: float
+    def _stratified_split(
+        self,
+        samples: List[Sample],
+        val_ratio: float,
+        test_ratio: float,
     ) -> Dict[str, List[Sample]]:
-        by_cls: Dict[int, List[Sample]] = defaultdict(list)
+        by_class: Dict[int, List[Sample]] = defaultdict(list)
         for s in samples:
-            by_cls[s.class_id].append(s)
+            by_class[s.class_id].append(s)
 
         train, val, test = [], [], []
-        for cls_s in by_cls.values():
-            random.shuffle(cls_s)
-            n     = len(cls_s)
-            n_tst = max(1, int(n * test_r))
-            n_val = max(1, int(n * val_r))
-            test.extend(cls_s[:n_tst])
-            val.extend( cls_s[n_tst:n_tst+n_val])
-            train.extend(cls_s[n_tst+n_val:])
+        for cls_id, cls_samples in by_class.items():
+            random.shuffle(cls_samples)
+            n     = len(cls_samples)
+            n_val = max(1, int(n * val_ratio))
+            n_tst = max(1, int(n * test_ratio))
+            test.extend(cls_samples[:n_tst])
+            val.extend( cls_samples[n_tst:n_tst + n_val])
+            train.extend(cls_samples[n_tst + n_val:])
 
         random.shuffle(train)
         return {"train": train, "val": val, "test": test}
 
-    def _write(self, splits: Dict[str, List[Sample]], out: Path):
-        for split, ss in splits.items():
-            for s in ss:
-                dst_dir = out / split / s.class_name
+    def _write_split(
+        self, splits: Dict[str, List[Sample]], out_root: Path
+    ):
+        for split_name, split_samples in splits.items():
+            for s in split_samples:
+                dst_dir = out_root / split_name / s.class_name
                 dst_dir.mkdir(parents=True, exist_ok=True)
-                dst = dst_dir / s.path.name
-                # Tránh ghi đè
-                if dst.exists():
+                dst_path = dst_dir / s.path.name
+                # Handle name collisions
+                if dst_path.exists():
+                    stem = s.path.stem
+                    suffix = s.path.suffix
                     i = 1
-                    while dst.exists():
-                        dst = dst_dir / f"{s.path.stem}_{i}{s.path.suffix}"
+                    while dst_path.exists():
+                        dst_path = dst_dir / f"{stem}_{i}{suffix}"
                         i += 1
-                shutil.copy2(s.path, dst)
+                shutil.copy2(s.path, dst_path)
 
-    def _dist(self, samples: List[Sample]) -> Dict[str, int]:
-        return dict(Counter(s.class_name for s in samples))
+    def _compute_stats(
+        self,
+        splits: Dict[str, List[Sample]],
+        dup_removed: int,
+        out_dir: str,
+    ) -> DatasetStats:
+        def dist(lst):
+            c = Counter(s.class_name for s in lst)
+            return dict(c)
 
-    def _write_manifest(self, splits: Dict[str, List[Sample]], out: Path):
+        all_samples = splits["train"] + splits["val"] + splits["test"]
+        return DatasetStats(
+            total_samples   = len(all_samples),
+            train_count     = len(splits["train"]),
+            val_count       = len(splits["val"]),
+            test_count      = len(splits["test"]),
+            class_distribution = dist(all_samples),
+            train_dist      = dist(splits["train"]),
+            val_dist        = dist(splits["val"]),
+            test_dist       = dist(splits["test"]),
+            duplicate_removed = dup_removed,
+            output_dir      = out_dir,
+        )
+
+    def _write_manifest(
+        self, splits: Dict[str, List[Sample]], out_root: Path
+    ):
         manifest = {
-            sp: [{"file": s.path.name, "class": s.class_name, "id": s.class_id}
-                 for s in ss]
-            for sp, ss in splits.items()
+            split: [
+                {"path": str(s.path.name), "class": s.class_name, "id": s.class_id}
+                for s in lst
+            ]
+            for split, lst in splits.items()
         }
-        with open(out / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-        log.info(f"Manifest → {out/'manifest.json'}")
+        with open(out_root / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        logger.info(f"Manifest written → {out_root / 'manifest.json'}")
 
 
-# ── Validate (standalone) ─────────────────────────────────────────────────────
+# ── CLI shortcut ──────────────────────────────────────────────────────────
 
-def validate(
-    dataset_dir:     str,
-    min_per_class:   int   = 20,
-    blur_thr:        float = 60.0,
-    dark_thr:        float = 25.0,
-    check_leakage:   bool  = True,
-) -> ValidationReport:
+def main():
+    import argparse
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    from src.utils.config_loader import load_config
+
+    parser = argparse.ArgumentParser(description="Build training dataset from labeled CCTV data")
+    parser.add_argument("--labeled",  default="data/labeled",   help="Labeled data root")
+    parser.add_argument("--output",   default="data/processed",  help="Output root")
+    parser.add_argument("--val",      type=float, default=0.15,  help="Val ratio")
+    parser.add_argument("--test",     type=float, default=0.10,  help="Test ratio")
+    parser.add_argument("--balance",  type=int,   default=None,  help="Target samples per class")
+    parser.add_argument("--config",   default="configs/config.yaml")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    builder = DatasetBuilder(cfg)
+    builder.build(
+        labeled_dir      = args.labeled,
+        output_dir       = args.output,
+        val_ratio        = args.val,
+        test_ratio       = args.test,
+        target_per_class = args.balance,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ── Static Image Folder Ingestor ──────────────────────────────────────────
+
+class ImageFolderIngestor:
     """
-    Kiểm tra toàn bộ dataset sau khi build.
+    Ingest a flat folder of camera screenshots that are already
+    organized by class name (mirrors ImageNet folder convention):
 
-    Các kiểm tra:
-        - Thư mục train/val/test tồn tại
-        - Đủ ảnh tối thiểu mỗi class
-        - Phát hiện class mất cân bằng nghiêm trọng
-        - Ảnh bị hỏng / không đọc được
-        - Ảnh quá mờ (Laplacian variance < blur_thr)
-        - Ảnh quá tối (mean < dark_thr)
-        - Data leakage: cùng ảnh xuất hiện ở nhiều split
+        raw_images/
+            Normal/        ← CCTV screenshots of normal activity
+            Fighting/
+            Falling/
+            Loitering/
+            Crowd Panic/
 
-    Args:
-        dataset_dir:   đường dẫn đến data/processed/
-        min_per_class: số ảnh tối thiểu mỗi class trong train
-        blur_thr:      ngưỡng Laplacian variance (ảnh dưới = mờ)
-        dark_thr:      ngưỡng độ sáng trung bình (ảnh dưới = tối)
-        check_leakage: bật kiểm tra MD5 cross-split
+    Copies everything into labeled/<folder_name>/<class>/ so that
+    DatasetBuilder.build() can pick it up in the next step.
 
-    Returns:
-        ValidationReport
+    Usage:
+        ingestor = ImageFolderIngestor()
+        ingestor.ingest("raw_images", "data/labeled/static_cam")
     """
-    root   = Path(dataset_dir)
-    report = ValidationReport()
-    exts   = {".jpg", ".jpeg", ".png", ".bmp"}
 
-    split_hashes: Dict[str, Dict[str, str]] = {}   # split → {path_str: md5}
-    total_img = corrupt = blurry = dark = 0
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 
-    for split in SPLITS:
-        sd = root / split
-        if not sd.exists():
-            (report.error if split == "train" else report.warn)(
-                f"Thiếu thư mục: {sd}"
-            )
-            continue
-
-        hashes: Dict[str, str] = {}
-        split_counts: Dict[str, int] = {}
-
+    def ingest(
+        self,
+        src_root: str,
+        out_root: str,
+        resize: tuple = None,
+    ) -> Dict[str, int]:
+        """
+        Copy + optionally resize images from src_root into out_root.
+        Returns dict of {class_name: count}.
+        """
+        import shutil, cv2 as _cv2
+        src = Path(src_root)
+        dst = Path(out_root)
+        counts = {}
         for cls_name in CLASS_NAMES.values():
-            cd = sd / cls_name
-            if not cd.exists():
-                report.warn(f"Thiếu class dir: {split}/{cls_name}")
-                split_counts[cls_name] = 0
+            cls_src = src / cls_name
+            if not cls_src.exists():
                 continue
-
-            imgs = [p for p in cd.iterdir() if p.suffix.lower() in exts]
-            split_counts[cls_name] = len(imgs)
-            total_img += len(imgs)
-
-            for p in imgs:
-                # Corrupt check
-                img = cv2.imread(str(p))
-                if img is None:
-                    report.warn(f"Ảnh hỏng: {p.relative_to(root)}")
-                    corrupt += 1
+            cls_dst = dst / cls_name
+            cls_dst.mkdir(parents=True, exist_ok=True)
+            n = 0
+            for p in cls_src.iterdir():
+                if p.suffix.lower() not in self.IMG_EXTS:
                     continue
-
-                # Leakage hash
-                with open(p, "rb") as f:
-                    md5 = hashlib.md5(f.read()).hexdigest()
-                hashes[str(p)] = md5
-
-                # Blur
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                if cv2.Laplacian(gray, cv2.CV_64F).var() < blur_thr:
-                    blurry += 1
-
-                # Dark
-                if gray.mean() < dark_thr:
-                    dark += 1
-
-        report.counts[split] = split_counts
-        split_hashes[split]  = hashes
-
-        # Class balance check (train only)
-        if split == "train" and split_counts:
-            max_n = max(split_counts.values()) if split_counts else 1
-            for cls_name, n in split_counts.items():
-                if n < min_per_class:
-                    report.error(
-                        f"Quá ít mẫu train — {cls_name}: {n} "
-                        f"(cần ≥ {min_per_class})"
-                    )
-                elif max_n > 0 and n / max_n < 0.15:
-                    report.warn(
-                        f"Mất cân bằng nghiêm trọng — {cls_name}: "
-                        f"{n} vs max {max_n} ({n/max_n*100:.0f}%)"
-                    )
-
-    # Cross-split leakage
-    if check_leakage:
-        sp_list = list(split_hashes.items())
-        for i in range(len(sp_list)):
-            for j in range(i+1, len(sp_list)):
-                s1, h1 = sp_list[i]
-                s2, h2 = sp_list[j]
-                leak   = set(h1.values()) & set(h2.values())
-                if leak:
-                    report.warn(
-                        f"Data leakage: {len(leak)} ảnh trùng giữa "
-                        f"{s1} và {s2}"
-                    )
-
-    # Quality summary warnings
-    if total_img > 0:
-        if blurry / total_img > 0.20:
-            report.warn(
-                f"{blurry/total_img*100:.1f}% ảnh có thể mờ "
-                f"(Laplacian < {blur_thr})"
-            )
-        if dark / total_img > 0.15:
-            report.warn(
-                f"{dark/total_img*100:.1f}% ảnh có thể quá tối "
-                f"(mean < {dark_thr})"
-            )
-        if corrupt:
-            report.error(f"{corrupt} ảnh bị hỏng không đọc được")
-
-    report.print()
-    return report
+                if resize:
+                    img = _cv2.imread(str(p))
+                    if img is None:
+                        continue
+                    img = _cv2.resize(img, resize)
+                    _cv2.imwrite(str(cls_dst / p.name), img)
+                else:
+                    shutil.copy2(p, cls_dst / p.name)
+                n += 1
+            counts[cls_name] = n
+            logger.info(f"Ingested {n} images: {cls_name}")
+        return counts

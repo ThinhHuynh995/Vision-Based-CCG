@@ -1,152 +1,233 @@
 """
-src/augmentation/augmentor.py — Branch 4: Data Augmentation
-============================================================
-  • Augmentor     – Pipeline Albumentations (fallback: OpenCV)
-  • MixUp/CutMix  – Advanced blending strategies
-  • augment_dir() – Batch CLI: nhân bội dataset
+Branch 4 — Data Augmentation
+=============================
+  • ImageAugmentor: Albumentations-based augmentation pipeline
+  • MixUpAugmentor: MixUp and CutMix for training
+  • DatasetBalancer: oversample rare classes
+  • generate_augmented_dataset(): CLI-usable batch generator
 """
 from __future__ import annotations
 import cv2
 import numpy as np
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple
-import src.utils.log as _log
+from typing import List, Tuple, Optional
 
-log = _log.get(__name__)
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
-class Augmentor:
+# ── Albumentations pipeline ───────────────────────────────────────────────
+
+class ImageAugmentor:
     """
-    Augmentation pipeline.
-    Dùng Albumentations nếu cài, ngược lại dùng OpenCV thuần.
+    Rich augmentation pipeline using Albumentations.
 
-    Sử dụng:
-        aug = Augmentor(cfg.augmentation)
-        out = aug(image_bgr)
-        grid = aug.grid(image_bgr, n=8)
+    Falls back to OpenCV transforms when Albumentations is not installed.
+
+    Usage:
+        aug = ImageAugmentor(cfg["augmentation"])
+        augmented = aug.augment(image)
+        grid = aug.show_grid(image, n=8)
     """
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
         self._pipeline = None
-        cfg = cfg or {}
-        self._p_flip   = float(getattr(cfg, "p_flip",   0) or cfg.get("p_flip",   0.5) if hasattr(cfg,"get") else 0.5)
-        self._p_rot    = float(getattr(cfg, "p_rotate", 0) or 0.35)
-        self._max_rot  = float(getattr(cfg, "max_rotate_deg", 0) or 15)
-        self._p_bri    = float(getattr(cfg, "p_brightness", 0) or 0.4)
-        self._p_blur   = float(getattr(cfg, "p_blur",   0) or 0.2)
-        self._try_albumentations()
+        self._try_build_albumentations(cfg)
 
-    def _try_albumentations(self):
+    def _try_build_albumentations(self, cfg: dict):
         try:
             import albumentations as A
+            from albumentations.pytorch import ToTensorV2  # noqa
+
             self._pipeline = A.Compose([
-                A.HorizontalFlip(p=self._p_flip),
-                A.Rotate(limit=int(self._max_rot), p=self._p_rot),
-                A.RandomBrightnessContrast(brightness_limit=0.25,
-                                           contrast_limit=0.25, p=self._p_bri),
-                A.GaussianBlur(blur_limit=(3,7), p=self._p_blur),
+                A.HorizontalFlip(p=cfg.get("p_flip", 0.5)),
+                A.Rotate(limit=cfg.get("max_rotate_deg", 15), p=cfg.get("p_rotate", 0.3)),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.25,
+                    contrast_limit=0.25,
+                    p=cfg.get("p_brightness", 0.4),
+                ),
+                A.GaussianBlur(blur_limit=(3, 7), p=cfg.get("p_blur", 0.2)),
                 A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, p=0.3),
-                A.RandomShadow(p=0.12),
-                A.CoarseDropout(max_holes=4, max_height=28, max_width=28, p=0.18),
-                A.Perspective(scale=(0.02, 0.07), p=0.18),
+                A.RandomShadow(p=0.15),
+                A.CoarseDropout(max_holes=4, max_height=32, max_width=32, p=0.2),
+                A.Perspective(scale=(0.02, 0.07), p=0.2),
             ])
-            log.info("Augmentor: Albumentations")
+            logger.info("ImageAugmentor: using Albumentations pipeline")
         except ImportError:
-            log.warning("Albumentations chưa cài → dùng OpenCV fallback")
+            logger.warning("Albumentations not installed – using OpenCV fallback")
+            self._pipeline = None
 
-    def __call__(self, img: np.ndarray) -> np.ndarray:
+    def augment(self, image: np.ndarray) -> np.ndarray:
+        """Apply augmentation pipeline to a BGR image."""
         if self._pipeline is not None:
-            return self._pipeline(image=img)["image"]
-        return self._cv(img)
+            result = self._pipeline(image=image)
+            return result["image"]
+        return self._opencv_augment(image)
 
-    def _cv(self, img: np.ndarray) -> np.ndarray:
-        out = img.copy()
-        if random.random() < self._p_flip:
-            out = cv2.flip(out, 1)
-        if random.random() < self._p_bri:
-            a = random.uniform(0.7, 1.3)
-            b = random.randint(-30, 30)
-            out = cv2.convertScaleAbs(out, alpha=a, beta=b)
-        if random.random() < self._p_blur:
+    def _opencv_augment(self, image: np.ndarray) -> np.ndarray:
+        """Pure OpenCV augmentation fallback."""
+        img = image.copy()
+
+        # Horizontal flip
+        if random.random() < 0.5:
+            img = cv2.flip(img, 1)
+
+        # Brightness / contrast
+        if random.random() < 0.4:
+            alpha = random.uniform(0.7, 1.3)  # contrast
+            beta  = random.randint(-30, 30)   # brightness
+            img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+
+        # Gaussian blur
+        if random.random() < 0.2:
             k = random.choice([3, 5])
-            out = cv2.GaussianBlur(out, (k, k), 0)
-        if random.random() < self._p_rot:
-            angle = random.uniform(-self._max_rot, self._max_rot)
-            h, w  = out.shape[:2]
-            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-            out = cv2.warpAffine(out, M, (w, h))
-        return out
+            img = cv2.GaussianBlur(img, (k, k), 0)
 
-    def grid(self, img: np.ndarray, n: int = 8) -> np.ndarray:
-        """Lưới n ảnh augmented để kiểm tra trực quan."""
+        # Rotation
+        if random.random() < 0.3:
+            angle = random.uniform(-15, 15)
+            h, w  = img.shape[:2]
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h))
+
+        return img
+
+    def augment_batch(self, images: List[np.ndarray], n_per_image: int = 3) -> List[np.ndarray]:
+        """Generate n augmented versions per input image."""
+        results = []
+        for img in images:
+            for _ in range(n_per_image):
+                results.append(self.augment(img))
+        return results
+
+    def show_grid(self, image: np.ndarray, n: int = 8) -> np.ndarray:
+        """Return a grid of n augmented versions for visual inspection."""
         cols = 4
         rows = (n + cols - 1) // cols
-        h, w = img.shape[:2]
-        grid = np.zeros((rows*h, cols*w, 3), dtype=np.uint8)
+        h, w = image.shape[:2]
+        grid = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
         for i in range(n):
+            aug = self.augment(image)
             r, c = divmod(i, cols)
-            grid[r*h:(r+1)*h, c*w:(c+1)*w] = cv2.resize(self(img), (w, h))
+            grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = cv2.resize(aug, (w, h))
         return grid
 
 
-class MixUp:
-    """MixUp và CutMix cho training loop."""
+# ── MixUp & CutMix ────────────────────────────────────────────────────────
+
+class MixUpAugmentor:
+    """
+    Implements MixUp and CutMix augmentation strategies.
+
+    Usage (in training loop):
+        mixup = MixUpAugmentor(alpha=0.4)
+        mixed_img, lam, label_a, label_b = mixup.mixup(img_a, img_b, lbl_a, lbl_b)
+        # loss = lam * criterion(out, label_a) + (1-lam) * criterion(out, label_b)
+    """
 
     def __init__(self, alpha: float = 0.4):
         self.alpha = alpha
 
-    def mixup(self, a: np.ndarray, b: np.ndarray,
-              la: int, lb: int) -> Tuple[np.ndarray, float, int, int]:
+    def mixup(
+        self,
+        img_a: np.ndarray,
+        img_b: np.ndarray,
+        label_a: int,
+        label_b: int,
+    ) -> Tuple[np.ndarray, float, int, int]:
+        """
+        Blend two images linearly.
+
+        Returns:
+            (mixed_image, lambda, label_a, label_b)
+        """
         lam = np.random.beta(self.alpha, self.alpha)
-        b_r = cv2.resize(b, (a.shape[1], a.shape[0]))
-        mixed = (lam*a.astype(np.float32) + (1-lam)*b_r.astype(np.float32)).astype(np.uint8)
-        return mixed, lam, la, lb
+        img_b_resized = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
+        mixed = (lam * img_a.astype(np.float32) +
+                 (1 - lam) * img_b_resized.astype(np.float32)).astype(np.uint8)
+        return mixed, lam, label_a, label_b
 
-    def cutmix(self, a: np.ndarray, b: np.ndarray,
-               la: int, lb: int) -> Tuple[np.ndarray, float, int, int]:
-        h, w = a.shape[:2]
-        b_r  = cv2.resize(b, (w, h))
-        lam  = np.random.beta(self.alpha, self.alpha)
-        cw, ch = int(w * np.sqrt(1-lam)), int(h * np.sqrt(1-lam))
-        cx, cy = random.randint(0, w), random.randint(0, h)
-        x1,x2 = max(cx-cw//2,0), min(cx+cw//2,w)
-        y1,y2 = max(cy-ch//2,0), min(cy+ch//2,h)
-        mixed = a.copy()
-        mixed[y1:y2, x1:x2] = b_r[y1:y2, x1:x2]
-        lam = 1 - (x2-x1)*(y2-y1)/(w*h)
-        return mixed, lam, la, lb
+    def cutmix(
+        self,
+        img_a: np.ndarray,
+        img_b: np.ndarray,
+        label_a: int,
+        label_b: int,
+    ) -> Tuple[np.ndarray, float, int, int]:
+        """
+        Paste a random rectangular patch from img_b onto img_a.
+
+        Returns:
+            (mixed_image, lambda, label_a, label_b)
+        """
+        h, w = img_a.shape[:2]
+        img_b_r = cv2.resize(img_b, (w, h))
+        mixed = img_a.copy()
+
+        # Sample patch size from Beta distribution
+        lam = np.random.beta(self.alpha, self.alpha)
+        cut_w = int(w * np.sqrt(1 - lam))
+        cut_h = int(h * np.sqrt(1 - lam))
+
+        cx = random.randint(0, w)
+        cy = random.randint(0, h)
+        x1, x2 = max(cx - cut_w // 2, 0), min(cx + cut_w // 2, w)
+        y1, y2 = max(cy - cut_h // 2, 0), min(cy + cut_h // 2, h)
+
+        mixed[y1:y2, x1:x2] = img_b_r[y1:y2, x1:x2]
+        # Recompute lambda from actual patch area
+        lam = 1 - (x2 - x1) * (y2 - y1) / (w * h)
+        return mixed, lam, label_a, label_b
 
 
-def augment_dir(src: str, dst: str, n: int = 5, cfg=None) -> int:
+# ── Dataset Generator ─────────────────────────────────────────────────────
+
+def generate_augmented_dataset(
+    src_dir: str,
+    dst_dir: str,
+    n_per_image: int = 5,
+    cfg: Optional[dict] = None,
+) -> None:
     """
-    Nhân bội toàn bộ ảnh trong src → dst, giữ cấu trúc thư mục.
-    Trả về tổng số ảnh đã tạo.
+    Batch-augment all images from src_dir and save to dst_dir,
+    preserving class subdirectory structure.
 
-    Sử dụng:
-        augment_dir("data/processed/train", "data/augmented/train", n=5)
+    Args:
+        src_dir:      source dataset root (with class subfolders)
+        dst_dir:      destination root
+        n_per_image:  number of augmented copies per image
+        cfg:          augmentation config dict
     """
-    aug   = Augmentor(cfg)
-    exts  = {".jpg", ".jpeg", ".png", ".bmp"}
-    files = [p for p in Path(src).rglob("*") if p.suffix.lower() in exts]
-    total = 0
-    log.info(f"Augmenting {len(files)} ảnh → {dst}")
+    augmentor = ImageAugmentor(cfg or {})
+    src = Path(src_dir)
+    dst = Path(dst_dir)
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    images_found = list(src.rglob("*"))
+    images_found = [p for p in images_found if p.suffix.lower() in exts]
 
-    for img_path in files:
+    logger.info(f"Augmenting {len(images_found)} images → {dst}")
+
+    for img_path in images_found:
+        rel = img_path.relative_to(src)
+        out_dir = dst / rel.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         img = cv2.imread(str(img_path))
         if img is None:
             continue
-        rel     = img_path.relative_to(src)
-        out_dir = Path(dst) / rel.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # Copy gốc
-        cv2.imwrite(str(out_dir / img_path.name), img)
-        total += 1
-        # Augmented copies
-        for i in range(n):
-            aug_img = aug(img)
-            cv2.imwrite(str(out_dir / f"{img_path.stem}_aug{i:02d}{img_path.suffix}"), aug_img)
-            total += 1
 
-    log.info(f"Done. {total} ảnh → {dst}")
-    return total
+        # Copy original
+        cv2.imwrite(str(out_dir / img_path.name), img)
+
+        # Write augmented versions
+        for i in range(n_per_image):
+            aug = augmentor.augment(img)
+            stem = img_path.stem
+            out_path = out_dir / f"{stem}_aug{i:02d}{img_path.suffix}"
+            cv2.imwrite(str(out_path), aug)
+
+    logger.info(f"Done. Augmented dataset saved to {dst}")

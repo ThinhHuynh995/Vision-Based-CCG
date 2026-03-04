@@ -1,308 +1,462 @@
 """
-src/tracking/tracker.py — Branch 5: Video Tracking & Anomaly Detection
-=======================================================================
-  • Track          – State của một đối tượng đang theo dõi
-  • IoUTracker     – Multi-object tracker thuần IoU, không cần GPU
-  • FlowAnalyzer   – Farneback optical flow
-  • AnomalyChecker – Rule-based anomaly detection từ track state
-  • Pipeline       – Kết nối tất cả branches thành pipeline đầu cuối
+Branch 5 — Video Processing & Object Tracking
+=============================================
+  • SimpleTracker: IoU-based multi-object tracker (no heavy deps)
+  • TrackState: per-track state with velocity & loitering detection
+  • OpticalFlowAnalyzer: Farneback dense optical flow
+  • VideoProcessor: orchestrates detection + tracking + anomaly on video files
 """
 from __future__ import annotations
 import cv2
 import numpy as np
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import src.utils.log as _log
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+import time
 
-log = _log.get(__name__)
+from src.detection.detector import Detection
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
-# ── Track ─────────────────────────────────────────────────────────────────────
+# ── Track State ───────────────────────────────────────────────────────────
 
 @dataclass
-class Track:
-    tid: int
-    bbox: Tuple[int,int,int,int]
-    center: Tuple[int,int]
+class TrackState:
+    """Stores per-object tracking history and computes anomaly signals."""
+    track_id: int
+    bbox: Tuple[int, int, int, int]
+    center: Tuple[int, int]
     label: int = 0
-    conf: float = 1.0
-    centers: List[Tuple[int,int]] = field(default_factory=list)
-    speeds:  List[float]          = field(default_factory=list)
-    stationary: int = 0
-    age: int = 0
-    last_frame: int = 0
+    confidence: float = 1.0
 
-    def update(self, bbox, center, label, conf, fidx):
+    # History
+    centers: List[Tuple[int, int]] = field(default_factory=list)
+    velocities: List[float] = field(default_factory=list)
+    frames_stationary: int = 0
+    frames_alive: int = 0
+    last_seen: int = 0
+
+    def update(self, bbox, center, label, confidence, frame_idx: int):
+        self.bbox = bbox
+        # Velocity
         if self.centers:
-            dx, dy = center[0]-self.centers[-1][0], center[1]-self.centers[-1][1]
-            spd = (dx**2 + dy**2)**0.5
-            self.speeds.append(spd)
-            self.stationary = (self.stationary + 1) if spd < 3 else 0
-        self.bbox, self.center = bbox, center
-        self.label, self.conf  = label, conf
+            dx = center[0] - self.centers[-1][0]
+            dy = center[1] - self.centers[-1][1]
+            v = np.sqrt(dx ** 2 + dy ** 2)
+            self.velocities.append(v)
+            if v < 3:
+                self.frames_stationary += 1
+            else:
+                self.frames_stationary = 0
         self.centers.append(center)
-        self.age += 1
-        self.last_frame = fidx
-        if len(self.centers) > 120: self.centers.pop(0)
-        if len(self.speeds)  > 120: self.speeds.pop(0)
+        self.center = center
+        self.label = label
+        self.confidence = confidence
+        self.frames_alive += 1
+        self.last_seen = frame_idx
+        # Keep history bounded
+        if len(self.centers) > 120:
+            self.centers.pop(0)
+        if len(self.velocities) > 120:
+            self.velocities.pop(0)
 
     @property
     def avg_speed(self) -> float:
-        return float(np.mean(self.speeds[-10:])) if self.speeds else 0.0
+        if not self.velocities:
+            return 0.0
+        return float(np.mean(self.velocities[-10:]))
 
-    def trail(self, n: int = 40) -> List[Tuple[int,int]]:
-        return self.centers[-n:]
+    @property
+    def is_loitering(self) -> bool:
+        return self.frames_stationary >= 60
+
+    @property
+    def is_speeding(self) -> bool:
+        return self.avg_speed > 80
+
+    def trajectory(self) -> List[Tuple[int, int]]:
+        return self.centers[-40:]
 
 
-# ── IoU Tracker ───────────────────────────────────────────────────────────────
+# ── IoU-based Simple Tracker ──────────────────────────────────────────────
 
-def _iou(a, b) -> float:
-    ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
-    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-    inter = max(0,ix2-ix1)*max(0,iy2-iy1)
-    if not inter: return 0.0
-    return inter/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter)
+def _iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    return inter / (area_a + area_b - inter)
 
 
-class IoUTracker:
+class SimpleTracker:
     """
-    Multi-object tracker thuần IoU – không cần deep features, chạy tốt trên CPU.
+    Lightweight IoU-based multi-object tracker.
 
-    Sử dụng:
-        tracker = IoUTracker(cfg.tracking)
-        tracks = tracker.update(dets, labels, confs, frame_idx)
-        traj   = tracker.trajectories()
+    No external dependencies. Works purely on bounding box overlap.
+    Suitable for CPU-only environments.
+
+    Usage:
+        tracker = SimpleTracker(cfg["tracking"])
+        tracks = tracker.update(detections, labels, frame_idx)
     """
 
-    def __init__(self, cfg):
-        self._iou_thr  = float(cfg.iou_threshold or 0.30)
-        self._max_age  = int(cfg.max_age         or 30)
-        self._min_hits = int(cfg.min_hits        or 3)
-        self._tracks: Dict[int, Track] = {}
-        self._nid = 1
+    def __init__(self, cfg: dict):
+        self.iou_threshold = cfg.get("iou_threshold", 0.3)
+        self.max_age = cfg.get("max_age", 30)
+        self.min_hits = cfg.get("min_hits", 3)
+        self.tracks: Dict[int, TrackState] = {}
+        self._next_id = 1
 
-    def update(self, dets, labels=None, confs=None, fidx: int = 0) -> List[Track]:
-        labels = labels or [0]*len(dets)
-        confs  = confs  or [1.0]*len(dets)
-        matched, used = set(), set()
+    def update(
+        self,
+        detections: List[Detection],
+        labels: Optional[List[int]] = None,
+        confidences: Optional[List[float]] = None,
+        frame_idx: int = 0,
+    ) -> List[TrackState]:
+        """
+        Match current detections to existing tracks via IoU.
 
-        # Match detections → existing tracks
-        for i, det in enumerate(dets):
+        Args:
+            detections: list of Detection objects
+            labels: optional behavior label per detection
+            confidences: optional confidence per detection
+            frame_idx: current frame number
+
+        Returns:
+            List of active TrackState objects
+        """
+        if labels is None:
+            labels = [0] * len(detections)
+        if confidences is None:
+            confidences = [1.0] * len(detections)
+
+        matched = set()
+        used_tracks = set()
+
+        # Match detections to existing tracks
+        for i, det in enumerate(detections):
             best_iou, best_tid = 0.0, None
-            for tid, trk in self._tracks.items():
-                if tid in used: continue
-                v = _iou(det.bbox, trk.bbox)
-                if v > best_iou:
-                    best_iou, best_tid = v, tid
-            if best_iou >= self._iou_thr and best_tid is not None:
-                self._tracks[best_tid].update(det.bbox, det.center, labels[i], confs[i], fidx)
-                matched.add(i); used.add(best_tid)
+            for tid, track in self.tracks.items():
+                if tid in used_tracks:
+                    continue
+                iou = _iou(det.bbox, track.bbox)
+                if iou > best_iou:
+                    best_iou, best_tid = iou, tid
+
+            if best_iou >= self.iou_threshold and best_tid is not None:
+                self.tracks[best_tid].update(
+                    det.bbox, det.center, labels[i], confidences[i], frame_idx
+                )
+                matched.add(i)
+                used_tracks.add(best_tid)
             else:
-                t = Track(tid=self._nid, bbox=det.bbox, center=det.center,
-                          label=labels[i], conf=confs[i])
-                t.centers.append(det.center); t.last_frame = fidx
-                self._tracks[self._nid] = t
-                self._nid += 1
+                # New track
+                tid = self._next_id
+                self._next_id += 1
+                ts = TrackState(
+                    track_id=tid,
+                    bbox=det.bbox,
+                    center=det.center,
+                    label=labels[i],
+                    confidence=confidences[i],
+                )
+                ts.centers.append(det.center)
+                ts.last_seen = frame_idx
+                self.tracks[tid] = ts
 
-        # Remove stale
-        stale = [tid for tid, t in self._tracks.items()
-                 if fidx - t.last_frame > self._max_age]
+        # Remove stale tracks
+        stale = [tid for tid, t in self.tracks.items()
+                 if frame_idx - t.last_seen > self.max_age]
         for tid in stale:
-            del self._tracks[tid]
+            del self.tracks[tid]
 
-        return [t for t in self._tracks.values() if t.age >= self._min_hits]
+        return [t for t in self.tracks.values() if t.frames_alive >= self.min_hits]
 
-    def trajectories(self) -> Dict[int, List[Tuple[int,int]]]:
-        return {tid: t.trail() for tid, t in self._tracks.items()}
+    def get_trajectories(self) -> Dict[int, List[Tuple[int, int]]]:
+        return {tid: t.trajectory() for tid, t in self.tracks.items()}
 
     def reset(self):
-        self._tracks.clear(); self._nid = 1
+        self.tracks.clear()
+        self._next_id = 1
 
 
-# ── Optical Flow ──────────────────────────────────────────────────────────────
+# ── Optical Flow ──────────────────────────────────────────────────────────
 
-class FlowAnalyzer:
-    """Farneback dense optical flow cho phát hiện hướng & tốc độ chuyển động."""
+class OpticalFlowAnalyzer:
+    """
+    Dense optical flow using Farneback algorithm.
 
-    def analyze(self, prev: np.ndarray, curr: np.ndarray
-                ) -> Tuple[np.ndarray, np.ndarray]:
+    Visualizes motion direction & magnitude on video frames.
+
+    Usage:
+        flow = OpticalFlowAnalyzer()
+        magnitude_map, flow_vis = flow.analyze(prev_frame, curr_frame)
+    """
+
+    def analyze(
+        self, prev: np.ndarray, curr: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute dense optical flow between two consecutive frames.
+
+        Returns:
+            (magnitude_map, visualization_bgr)
+        """
         g1 = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
         g2 = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
         flow = cv2.calcOpticalFlowFarneback(
-            g1, g2, None, 0.5, 3, 15, 3, 5, 1.2, 0
+            g1, g2, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
         )
-        mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+        # HSV visualization
         hsv = np.zeros((*g1.shape, 3), dtype=np.uint8)
-        hsv[...,1] = 255
-        hsv[...,0] = (ang * 180 / np.pi / 2).astype(np.uint8)
-        hsv[...,2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        return mag, cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        hsv[..., 1] = 255
+        hsv[..., 0] = (ang * 180 / np.pi / 2).astype(np.uint8)
+        hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        return mag, vis
+
+    def mean_motion(self, magnitude_map: np.ndarray) -> float:
+        """Average motion magnitude across frame."""
+        return float(magnitude_map.mean())
 
 
-# ── Anomaly Checker ───────────────────────────────────────────────────────────
+# ── Anomaly Detector ──────────────────────────────────────────────────────
 
-class AnomalyChecker:
+class AnomalyDetector:
     """
-    Rule-based anomaly detection kết hợp classifier label + vật lý track.
-
-    Sử dụng:
-        ac = AnomalyChecker(cfg.anomaly)
-        anom = ac.check(track)      # str hoặc None
-        crowd = ac.check_crowd(n)   # str hoặc None
+    Rule-based anomaly detector that combines:
+      - Behavior classification label
+      - Track speed
+      - Loitering duration
+      - Crowd density
     """
 
-    def __init__(self, cfg):
-        self._spd    = float(cfg.speed_threshold  or 80)
-        self._loiter = int(cfg.loiter_frames      or 60)
-        self._crowd  = int(cfg.crowd_threshold    or 6)
-        self.log: List[Dict] = []
+    def __init__(self, cfg: dict):
+        self.speed_thresh   = cfg.get("speed_threshold", 80)
+        self.loiter_frames  = cfg.get("loiter_frames", 60)
+        self.crowd_thresh   = cfg.get("crowd_density_threshold", 5)
+        self.anomalies: List[Dict] = []
 
-    def check(self, t: Track, fidx: int) -> Optional[str]:
-        label_anom = {1: "FIGHTING", 2: "FALLING", 4: "CROWD PANIC"}
-        if t.label in label_anom:
-            return label_anom[t.label]
-        if t.avg_speed > self._spd:
+    def check_track(self, track: TrackState, frame_idx: int) -> Optional[str]:
+        """
+        Evaluate a single track for anomalies.
+
+        Returns:
+            Anomaly type string or None if normal
+        """
+        # DL classifier flagged abnormal
+        if track.label in {1, 2, 4}:  # Fighting, Falling, Panic
+            return {1: "FIGHTING", 2: "FALLING", 4: "CROWD PANIC"}[track.label]
+        # Rule: too fast
+        if track.is_speeding:
             return "RUNNING FAST"
-        if t.label == 3 or t.stationary >= self._loiter:
+        # Rule: loitering
+        if track.label == 3 or track.is_loitering:
             return "LOITERING"
         return None
 
-    def check_crowd(self, n: int) -> Optional[str]:
-        return f"CROWD DENSITY ({n})" if n >= self._crowd else None
+    def check_crowd(self, count: int) -> Optional[str]:
+        """Trigger crowd alert if density exceeds threshold."""
+        if count >= self.crowd_thresh:
+            return f"CROWD DENSITY ({count})"
+        return None
 
-    def record(self, atype: str, tid: int, fidx: int, center: Tuple):
-        e = {"time": time.strftime("%H:%M:%S"), "frame": fidx,
-             "track_id": tid, "type": atype, "center": center}
-        self.log.append(e)
-        log.warning(f"⚠  [{atype}] track={tid} frame={fidx}")
+    def log_anomaly(self, anomaly_type: str, track_id: int, frame_idx: int, center: Tuple):
+        entry = {
+            "frame": frame_idx,
+            "track_id": track_id,
+            "type": anomaly_type,
+            "center": center,
+            "time": time.strftime("%H:%M:%S"),
+        }
+        self.anomalies.append(entry)
+        logger.warning(f"⚠  ANOMALY [{anomaly_type}] track={track_id} frame={frame_idx}")
+
+    def get_report(self) -> List[Dict]:
+        return self.anomalies
 
 
-# ── Full Pipeline ─────────────────────────────────────────────────────────────
+# ── Video Processor ───────────────────────────────────────────────────────
 
-class Pipeline:
+class VideoProcessor:
     """
-    Kết nối tất cả 5 branches thành pipeline đầu-cuối.
+    Full video processing pipeline:
+    preprocess → detect → classify → track → anomaly detection
 
-    Sử dụng:
-        pipe = Pipeline(cfg)
-        summary = pipe.run("data/raw/cctv.mp4", "outputs/videos/out.mp4")
+    Usage:
+        vp = VideoProcessor(cfg)
+        vp.process_video("input.mp4", "output.mp4")
     """
 
-    def __init__(self, cfg):
-        from src.preprocessing.processor import Preprocessor
-        from src.detection.detector import PersonDetector, DensityMap
-        from src.classification.classifier import BehaviorClassifier
+    def __init__(self, cfg: dict):
+        from src.preprocessing.image_processor import ImagePreprocessor
+        from src.detection.detector import PersonDetector, DensityEstimator
+        from src.classification.behavior_classifier import BehaviorClassifier
 
-        self._pp     = Preprocessor(cfg.preprocessing)
-        self._det    = PersonDetector(cfg.detection)
-        self._clf    = BehaviorClassifier(cfg.classification)
-        self._track  = IoUTracker(cfg.tracking)
-        self._anomaly = AnomalyChecker(cfg.anomaly)
-        self._flow   = FlowAnalyzer() if cfg.tracking.optical_flow else None
-        self._dm: Optional[DensityMap] = None
-        self._DensityMap = DensityMap
-        log.info("Pipeline sẵn sàng")
+        self.cfg = cfg
+        self.preprocessor   = ImagePreprocessor(cfg.get("preprocessing", {}))
+        self.detector       = PersonDetector(cfg.get("detection", {}))
+        self.classifier     = BehaviorClassifier(cfg.get("classification", {}))
+        self.tracker        = SimpleTracker(cfg.get("tracking", {}))
+        self.anomaly_det    = AnomalyDetector(cfg.get("anomaly", {}))
+        self.flow_analyzer  = OpticalFlowAnalyzer() if cfg.get("tracking", {}).get("optical_flow", True) else None
 
-    def run(
+        self._density: Optional[DensityEstimator] = None
+        logger.info("VideoProcessor initialized")
+
+    def process_video(
         self,
-        source,
+        input_path: str,
         output_path: str,
-        max_frames: Optional[int] = None,
         show_heatmap: bool = True,
         show_flow: bool = False,
+        max_frames: Optional[int] = None,
     ) -> Dict:
-        import src.utils.draw as draw
+        """
+        Process a video file end-to-end.
 
-        cap = cv2.VideoCapture(source)
+        Args:
+            input_path:   path to input video / webcam index (int)
+            output_path:  path to save annotated video
+            show_heatmap: overlay crowd density heatmap
+            show_flow:    overlay optical flow visualization
+            max_frames:   limit processing to N frames (None = all)
+
+        Returns:
+            Summary dict with frame count, anomaly log, timing
+        """
+        from src.utils.visualizer import (
+            draw_detections, draw_trajectories, build_heatmap, put_stats
+        )
+
+        cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
-            raise RuntimeError(f"Không mở được nguồn: {source}")
+            raise RuntimeError(f"Cannot open video: {input_path}")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
         w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(
-            output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
-        )
-        self._dm = self._DensityMap((h, w))
-        prev, fidx, n_anom, t0 = None, 0, 0, time.time()
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        log.info(f"Bắt đầu xử lý: {source}")
+        from pathlib import Path as _P
+        _P(output_path).parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+        self._density = __import__(
+            "src.detection.detector", fromlist=["DensityEstimator"]
+        ).DensityEstimator(
+            (h, w),
+            decay=self.cfg.get("tracking", {}).get("heatmap_decay", 0.97),
+            radius=self.cfg.get("tracking", {}).get("density_radius", 20),
+        )
+
+        prev_frame = None
+        frame_idx = 0
+        t0 = time.time()
+        anomaly_count = 0
+
+        logger.info(f"Processing {total} frames from {input_path}")
 
         while True:
             ret, frame = cap.read()
-            if not ret or (max_frames and fidx >= max_frames):
+            if not ret or (max_frames and frame_idx >= max_frames):
                 break
 
-            # Branch 1: Preprocess
-            clean = self._pp(frame)
+            # ── Branch 1: Preprocess ──────────────────────
+            clean = self.preprocessor.process(frame)
 
-            # Branch 2: Detect
-            dets = self._det(clean)
-            self._dm.update(dets)
+            # ── Branch 2: Detect ──────────────────────────
+            detections = self.detector.detect(clean)
+            self._density.update(detections)
 
-            # Branch 3: Classify crops
+            # ── Branch 3: Classify crops ──────────────────
             labels, confs = [], []
-            for d in dets:
-                crop = d.crop(clean)
-                lbl, conf = self._clf(crop) if crop.size > 0 else (0, 1.0)
-                labels.append(lbl); confs.append(conf)
+            for det in detections:
+                x1, y1, x2, y2 = det.bbox
+                crop = clean[max(0,y1):y2, max(0,x1):x2]
+                if crop.size > 0:
+                    lbl, conf = self.classifier.predict(crop)
+                else:
+                    lbl, conf = 0, 1.0
+                labels.append(lbl)
+                confs.append(conf)
 
-            # Branch 5: Track
-            tracks = self._track.update(dets, labels, confs, fidx)
+            # ── Branch 5: Track ───────────────────────────
+            tracks = self.tracker.update(detections, labels, confs, frame_idx)
 
-            # Anomaly check
-            alarms = []
-            for t in tracks:
-                a = self._anomaly.check(t, fidx)
-                if a:
-                    self._anomaly.record(a, t.tid, fidx, t.center)
-                    alarms.append(a); n_anom += 1
-            ca = self._anomaly.check_crowd(len(dets))
-            if ca:
-                alarms.append(ca)
+            # ── Anomaly Check ─────────────────────────────
+            for track in tracks:
+                anomaly = self.anomaly_det.check_track(track, frame_idx)
+                if anomaly:
+                    anomaly_count += 1
+                    self.anomaly_det.log_anomaly(anomaly, track.track_id, frame_idx, track.center)
 
-            # Draw
-            out = clean.copy()
+            crowd_alert = self.anomaly_det.check_crowd(len(detections))
+
+            # ── Draw ──────────────────────────────────────
+            out = frame.copy()
+            boxes  = [d.bbox  for d in detections]
+            tids   = [None]    # track IDs populated below
+            tids   = [t.track_id for t in tracks] if tracks else None
+            t_boxes = [t.bbox for t in tracks]
+            t_lbls  = [t.label for t in tracks]
+            t_confs = [t.confidence for t in tracks]
+
             if show_heatmap:
-                out = draw.heatmap(out, self._dm.get())
-            if tracks:
-                out = draw.boxes(out, [t.bbox for t in tracks],
-                                 [t.tid for t in tracks],
-                                 [t.label for t in tracks],
-                                 [t.conf for t in tracks])
-            out = draw.trajectories(out, self._track.trajectories())
+                out = build_heatmap(out, self._density.get_heatmap())
 
-            # Branch 4 optical flow overlay (small PiP)
-            if show_flow and prev is not None and self._flow:
-                _, fvis = self._flow.analyze(prev, clean)
-                pip = cv2.resize(fvis, (w//4, h//4))
-                out[0:h//4, 0:w//4] = pip
+            if t_boxes:
+                out = draw_detections(out, t_boxes, tids, t_lbls, t_confs)
 
-            if alarms:
-                out = draw.alert_banner(out, " | ".join(set(alarms)))
+            traj = self.tracker.get_trajectories()
+            out = draw_trajectories(out, traj)
 
-            out = draw.stats_panel(out, {
-                "Frame":   str(fidx),
-                "Persons": str(len(dets)),
+            if show_flow and prev_frame is not None and self.flow_analyzer:
+                _, flow_vis = self.flow_analyzer.analyze(prev_frame, clean)
+                flow_small = cv2.resize(flow_vis, (w // 4, h // 4))
+                out[0:h // 4, 0:w // 4] = flow_small
+
+            # Stats panel
+            stats = {
+                "Frame":   str(frame_idx),
+                "Persons": str(len(detections)),
                 "Tracks":  str(len(tracks)),
-                "Alerts":  str(n_anom),
-            })
+                "Alerts":  str(anomaly_count),
+            }
+            if crowd_alert:
+                stats["⚠ CROWD"] = crowd_alert
+            out = put_stats(out, stats)
 
             writer.write(out)
-            prev = clean.copy()
-            fidx += 1
+            prev_frame = clean.copy()
+            frame_idx += 1
 
-        cap.release(); writer.release()
+        cap.release()
+        writer.release()
         elapsed = time.time() - t0
 
-        return {
-            "frames_processed": fidx,
-            "total_anomalies":  n_anom,
-            "fps_achieved":     round(fidx / max(elapsed, 0.001), 1),
-            "elapsed_sec":      round(elapsed, 2),
-            "anomaly_log":      self._anomaly.log,
+        summary = {
+            "frames_processed": frame_idx,
+            "total_anomalies": anomaly_count,
+            "anomaly_log": self.anomaly_det.get_report(),
+            "elapsed_sec": round(elapsed, 2),
+            "fps_achieved": round(frame_idx / max(elapsed, 1), 1),
         }
+        logger.info(
+            f"Done. {frame_idx} frames in {elapsed:.1f}s "
+            f"({summary['fps_achieved']} fps) | {anomaly_count} anomalies"
+        )
+        return summary
