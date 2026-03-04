@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────
+# Vision-Based Phát Hiện Hành Vi Bất Thường
+# Cấu hình dự án – chỉnh sửa file này thay vì sửa code
+# ─────────────────────────────────────────────────────────────
+
+project:
+  name: "Vision-Based Abnormal Behavior Detection"
+  version: "2.0.0"
+
+device: "cpu"   # "cpu" | "cuda" | "mps"
+seed: 42
+
+# ── Đường dẫn ────────────────────────────────────────────────
+paths:
+  data_raw:        "data/raw"
+  data_labeled:    "data/labeled"
+  data_processed:  "data/processed"
+  model_weights:   "models/weights"
+  output_videos:   "outputs/videos"
+  output_reports:  "outputs/reports"
+
+# ── Nguồn video / camera ─────────────────────────────────────
+# source: 0               # webcam mặc định
+# source: "data/raw/cctv.mp4"
+# source: "rtsp://192.168.1.100:554/stream"
+source: "data/raw"        # folder chứa video
+
+# ── Nhãn hành vi ─────────────────────────────────────────────
+classes:
+  0: "Normal"
+  1: "Fighting"
+  2: "Falling"
+  3: "Loitering"
+  4: "Crowd Panic"
+
+# ── Branch 1: Tiền xử lý ảnh ────────────────────────────────
+preprocessing:
+  resize: [640, 640]           # [width, height]
+  denoise:
+    method: "gaussian"         # gaussian | median | bilateral | nlm
+    kernel_size: 5
+  enhancement:
+    method: "clahe"            # clahe | histogram_eq | gamma
+    clip_limit: 2.0
+    tile_grid: [8, 8]
+  sharpen: false
+
+# ── Branch 2: Phát hiện người ────────────────────────────────
+detection:
+  model: "yolov8n"             # yolov8n | yolov8s  (fallback: hog)
+  confidence: 0.45
+  iou_threshold: 0.45
+  input_size: 640
+  motion_filter: true          # chỉ detect khi có chuyển động
+
+# ── Branch 3: Phân loại hành vi ──────────────────────────────
+classification:
+  model: "mobilenet_v3_small"  # mobilenet_v3_small | efficientnet_b0 | resnet50
+  num_classes: 5
+  confidence_threshold: 0.55
+  input_size: [224, 224]
+  epochs: 25
+  batch_size: 16
+  lr: 0.0005
+  weight_decay: 1.0e-4
+
+# ── Branch 4: Augmentation ───────────────────────────────────
+augmentation:
+  n_per_image: 5               # bản sao augment mỗi ảnh gốc
+  p_flip: 0.5
+  p_rotate: 0.35
+  max_rotate_deg: 15
+  p_brightness: 0.4
+  p_blur: 0.2
+  p_mixup: 0.3
+  mixup_alpha: 0.4
+
+# ── Branch 5: Tracking + Phát hiện bất thường ────────────────
+tracking:
+  max_age: 30                  # frame tối đa mất dấu trước khi xóa track
+  min_hits: 3                  # frame tối thiểu trước khi hiển thị track
+  iou_threshold: 0.30
+  optical_flow: true
+  heatmap_decay: 0.97
+
+anomaly:
+  speed_threshold: 80          # pixel/frame – nhanh bất thường
+  loiter_frames: 60            # frame đứng yên = loitering
+  crowd_threshold: 6           # số người / vùng = đám đông
+
+# ── Labeling tool ─────────────────────────────────────────────
+labeling:
+  frame_step: 5                # bước nhảy frame mặc định (phím D)
+  save_full_frame: false       # true = lưu cả frame, false = chỉ lưu crop
+  min_crop_size: [32, 32]      # [w, h] – bỏ qua crop quá nhỏ
+
+# ── Dataset builder ───────────────────────────────────────────
+dataset:
+  val_ratio: 0.15
+  test_ratio: 0.10
+  target_per_class: null       # null = không oversample; số nguyên = oversample đến N
+  remove_duplicates: true
+  min_image_size: [32, 32]
