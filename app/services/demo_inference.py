@@ -18,6 +18,101 @@ from app.services.object_tracking import (
     encode_jpg_data_url,
 )
 from app.services.pipeline import FrameFeatures, extract_features, preprocess_frame
+import base64
+import io
+import tempfile
+
+
+def _add_text_to_frame(
+    frame: np.ndarray,
+    text_lines: list[str],
+    position: tuple[int, int] = (10, 30),
+    font_scale: float = 0.6,
+    thickness: int = 1,
+    color: tuple[int, int, int] = (0, 255, 0),
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+) -> np.ndarray:
+    """Add multi-line text annotations to a frame."""
+    canvas = frame.copy()
+    y_offset = position[1]
+    for text in text_lines:
+        (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        # Draw semi-transparent background
+        cv2.rectangle(canvas, (position[0] - 2, y_offset - text_height - 2),
+                     (position[0] + text_width + 2, y_offset + 2), bg_color, -1)
+        cv2.putText(canvas, text, (position[0], y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   font_scale, color, thickness)
+        y_offset += text_height + 8
+    return canvas
+
+
+def _create_annotated_video_bytes(
+    frames: list[np.ndarray],
+    time_series_data: list[dict[str, object]],
+    fps: float = 30.0,
+) -> bytes:
+    """Create an annotated video from frames and time series metadata."""
+    if not frames or not time_series_data:
+        return b''
+
+    frame_height, frame_width = frames[0].shape[:2]
+
+    # Use a temporary file for the video
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(tmp_path, fourcc, fps, (frame_width, frame_height))
+
+        if not out.isOpened():
+            raise RuntimeError("Failed to create video writer")
+
+        # Write frames with annotations
+        for idx, frame in enumerate(frames):
+            # Get corresponding time series data if available
+            ts_data = time_series_data[idx] if idx < len(time_series_data) else {}
+
+            # Prepare annotation text
+            text_lines = []
+            if 'frame_index' in ts_data:
+                text_lines.append(f"Frame: {ts_data['frame_index']}")
+            if 't_sec' in ts_data:
+                text_lines.append(f"Time: {ts_data['t_sec']}s")
+            if 'behavior_label' in ts_data:
+                text_lines.append(f"Behavior: {ts_data['behavior_label']}")
+            if 'motion' in ts_data:
+                text_lines.append(f"Motion: {ts_data['motion']:.4f}")
+            if 'mean_intensity' in ts_data:
+                text_lines.append(f"Intensity: {ts_data['mean_intensity']:.1f}")
+            if 'object_count' in ts_data:
+                text_lines.append(f"Objects: {ts_data['object_count']}")
+
+            # Add annotations to frame
+            annotated_frame = _add_text_to_frame(frame, text_lines)
+            out.write(annotated_frame)
+
+        out.release()
+
+        # Read the video file and convert to base64
+        with open(tmp_path, 'rb') as f:
+            video_bytes = f.read()
+
+        return video_bytes
+    finally:
+        # Clean up temp file
+        import os
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _encode_video_data_url(video_bytes: bytes, mime_type: str = 'video/mp4') -> str:
+    """Encode video bytes as a data URL."""
+    if not video_bytes:
+        return ""
+    encoded = base64.b64encode(video_bytes).decode('ascii')
+    return f"data:{mime_type};base64,{encoded}"
 
 
 @dataclass
@@ -34,6 +129,7 @@ class DemoResult:
     objects: list[dict[str, object]]
     time_series: list[dict[str, object]]
     annotated_frame_data_url: str
+    annotated_video_data_url: str
     step_metrics: list[dict[str, object]]
 
 
@@ -201,6 +297,7 @@ def _build_result(
         objects=objects,
         time_series=[],
         annotated_frame_data_url=encode_jpg_data_url(annotated_frame),
+        annotated_video_data_url="",
         step_metrics=step_metrics,
     )
 
@@ -364,6 +461,7 @@ def analyze_video_file(
     timings["augment"] = _as_ms(perf_counter() - t0)
 
     features: list[FrameFeatures] = []
+    frames_for_video: list[np.ndarray] = []  # Store frames for video generation
     prev_processed = preprocess_frame(prev)
     last_frame = prev.copy()
     tracked_objects = tracker.update(detector.detect_people(prev))
@@ -410,6 +508,10 @@ def analyze_video_file(
             }
         )
 
+        # Draw annotations on frame and store for video
+        annotated_frame = draw_tracked_objects(cur, tracked_objects)
+        frames_for_video.append(annotated_frame)
+
         last_frame = cur.copy()
         prev = cur
         prev_processed = cur_processed
@@ -442,5 +544,12 @@ def analyze_video_file(
     timings["output"] = _as_ms(perf_counter() - t0)
     result.step_metrics[-1]["metrics"]["time_ms"] = timings["output"]
     result.time_series = time_series
+
+    # Generate annotated video
+    try:
+        video_bytes = _create_annotated_video_bytes(frames_for_video, time_series, fps)
+        result.annotated_video_data_url = _encode_video_data_url(video_bytes)
+    except Exception:
+        result.annotated_video_data_url = ""
 
     return result

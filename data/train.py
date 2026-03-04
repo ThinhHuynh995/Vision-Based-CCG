@@ -37,10 +37,11 @@ from app.services.behavior_model import BehaviorClassifier
 from app.services.pipeline import FrameFeatures, extract_features, process_video_with_processed_frames
 
 DEFAULT_TRAIN_DIRS = [
-    r"D:\NWPU-Videos\videos\NWPUCampusDataset\videos\Train",
-    r"E:\1. ThS\shanghaitech\shanghaitech\training\videos",
-    r"E:\1. ThS\Avenue Dataset\training_videos",
-    r"E:\1. ThS\Normal_Videos",
+    r"E:\1.ThS\NWPU-Videos\Train",
+    r"E:\1.ThS\shanghaitech\training\videos",
+    r"E:\1.ThS\Avenue Dataset\training_videos",
+    r"E:\1.ThS\Normal_Videos",
+    r"E:\1.ThS\Anomaly-Videos",
 
 ]
 DEFAULT_ANNOTATION_PATH = Path("behavior_annotations.json")
@@ -145,6 +146,36 @@ def _bootstrap_segments_from_videos(
     return len(videos)
 
 
+def _bootstrap_all_videos_from_dirs(
+    annotation_path: Path,
+    train_dirs: list[Path],
+    bootstrap_end_frame: int = 300,
+) -> int:
+    """Discover ALL videos from train directories and create annotations for them."""
+    videos = _find_videos(train_dirs, max_items=None)
+    if not videos:
+        return 0
+
+    payload = {
+        "videos": [
+            {
+                "video": str(video),
+                "segments": [
+                    {
+                        "start_frame": 0,
+                        "end_frame": bootstrap_end_frame,
+                        "label": "normal_flow",
+                    }
+                ],
+            }
+            for video in videos
+        ]
+    }
+    annotation_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[INFO] Created annotation with {len(videos)} videos from train directories")
+    return len(videos)
+
+
 def _collect_samples(entries: list[dict[str, object]], train_dirs: list[Path]) -> list[dict[str, object]]:
     samples: list[dict[str, object]] = []
 
@@ -194,7 +225,25 @@ def load_annotations(
     bootstrap_max_videos: int,
     bootstrap_end_frame: int,
     force_bootstrap_all: bool,
+    train_all_videos: bool = True,
 ) -> list[dict[str, object]]:
+    # If train_all_videos is enabled, always regenerate from all videos in directories
+    if train_all_videos:
+        generated = _bootstrap_all_videos_from_dirs(
+            annotation_path=annotation_path,
+            train_dirs=train_dirs,
+            bootstrap_end_frame=bootstrap_end_frame,
+        )
+        if generated == 0:
+            raise RuntimeError("No videos found in train directories.")
+        print(f"[INFO] Training all {generated} videos found in train directories.")
+        payload = json.loads(annotation_path.read_text(encoding="utf-8-sig"))
+        entries = payload.get("videos", []) if isinstance(payload, dict) else payload
+        samples = _collect_samples(entries, train_dirs)
+        if not samples:
+            raise RuntimeError("No valid segments were collected from videos.")
+        return samples
+
     _ensure_annotation_exists(annotation_path, template_path)
     if force_bootstrap_all:
         generated = _bootstrap_segments_from_videos(
@@ -499,10 +548,10 @@ def run_training(
     bootstrap_max_videos: int,
     bootstrap_end_frame: int,
     force_bootstrap_all: bool,
+    train_all_videos: bool,
     checkpoint_path: Path,
     seed: int,
 ) -> None:
-    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -519,6 +568,7 @@ def run_training(
         bootstrap_max_videos=bootstrap_max_videos,
         bootstrap_end_frame=bootstrap_end_frame,
         force_bootstrap_all=force_bootstrap_all,
+        train_all_videos=train_all_videos,
     )
     print(f"Loaded {len(samples)} labeled segments from {annotation_path}")
 
@@ -607,6 +657,7 @@ def run_training(
                 "bootstrap_max_videos": bootstrap_max_videos,
                 "bootstrap_end_frame": bootstrap_end_frame,
                 "force_bootstrap_all": force_bootstrap_all,
+                "train_all_videos": train_all_videos,
                 "seed": seed,
             },
         },
@@ -654,6 +705,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore existing annotation and regenerate from videos in train dirs.",
     )
+    parser.add_argument(
+        "--no-train-all-videos",
+        action="store_true",
+        help="Disable automatic training of all videos in DEFAULT_TRAIN_DIRS. Use existing annotations instead.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -677,6 +733,7 @@ def main() -> None:
         bootstrap_max_videos=args.bootstrap_max_videos,
         bootstrap_end_frame=args.bootstrap_end_frame,
         force_bootstrap_all=args.bootstrap_all_videos,
+        train_all_videos=(not args.no_train_all_videos),
         checkpoint_path=args.checkpoint,
         seed=args.seed,
     )
