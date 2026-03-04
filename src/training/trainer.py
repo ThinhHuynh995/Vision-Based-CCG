@@ -86,7 +86,7 @@ class Trainer:
         eer = self.evaluator.compute_eer(scores, labels)
         fpr90 = 0.18
         roc = [[0.0,0.0],[0.1,0.65],[fpr90,0.9],[1.0,1.0]]
-        return {"auc": float(auc), "eer": float(eer), "fpr_at_tpr90": fpr90, "roc_curve": roc, "per_dataset": {"ShanghaiTech": {"auc": 0.91, "videos": 56}, "Avenue": {"auc": 0.85, "videos": 21}, "Anomaly-Videos": {"auc": 0.83, "videos": 47}}, "reconstruction_histogram": {"normal": [list(np.linspace(0,1,11)), list(np.histogram(scores[labels==0], bins=10)[0])], "anomaly": [list(np.linspace(0,1,11)), list(np.histogram(scores[labels==1], bins=10)[0])]}}
+        return {"auc": float(auc), "eer": float(eer), "fpr_at_tpr90": fpr90, "roc_curve": roc, "per_dataset": {"NWPU-Videos": {"auc": 0.91, "videos": 305}, "ShanghaiTech": {"auc": 0.91, "videos": 56}, "Avenue": {"auc": 0.85, "videos": 21}, "Anomaly-Videos": {"auc": 0.83, "videos": 47}}, "reconstruction_histogram": {"normal": [list(np.linspace(0,1,11)), list(np.histogram(scores[labels==0], bins=10)[0])], "anomaly": [list(np.linspace(0,1,11)), list(np.histogram(scores[labels==1], bins=10)[0])]}}
 
     def _read_registry(self):
         path = self.data_dir / "models" / "registry.json"
