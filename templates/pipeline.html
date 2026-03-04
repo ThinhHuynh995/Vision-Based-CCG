@@ -1,0 +1,14 @@
+<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pipeline DCAD</title><link rel="stylesheet" href="/static/css/main.css"></head><body>
+{% include 'partials/nav.html' %}
+<main class="panel page">
+<h1>Quy trình DCAD & công thức CCG</h1>
+<div class="timeline-vertical">
+  {% for s in ['Tải media','Data Augmentation','Tiền xử lý 1','Tiền xử lý 2','Segmentation/Detection','Density Map','Motion Analysis','DCAD+CCG'] %}
+  <div class="tl-item"><div class="dot"></div><div><h3>{{ loop.index }}. {{ s }}</h3><p><i>Chi tiết kỹ thuật theo pipeline bắt buộc.</i></p><div class="tags"><span>CLAHE</span><span>Bilateral</span><span>Canny</span><span>Sobel</span><span>CCG</span></div></div></div>
+  {% endfor %}
+</div>
+<div class="formula-grid"><div class="panel"><h3>g(k)</h3><code>g(k_t)=σ(W_k·embed(k_t)+b_k)</code></div><div class="panel"><h3>τ(t)</h3><code>τ=τ_base+α·g(k_t)</code></div><div class="panel"><h3>Quyết định</h3><code>Anomaly nếu s_t > τ(t)</code></div></div>
+<table><tr><th>Mật độ</th><th>Gate</th><th>Threshold</th></tr><tr><td>Thấp</td><td>0.2</td><td>0.56</td></tr><tr><td>Vừa</td><td>0.5</td><td>0.65</td></tr><tr><td>Cao</td><td>0.8</td><td>0.74</td></tr></table>
+</main>
+{% include 'partials/footer.html' %}
+</body></html>
