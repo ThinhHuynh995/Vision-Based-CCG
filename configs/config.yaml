@@ -1,104 +1,103 @@
-# ─────────────────────────────────────────────
-# Vision-Based Abnormal Behavior Detection
-# Configuration File
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Vision-Based Phát Hiện Hành Vi Bất Thường
+# Cấu hình dự án – chỉnh sửa file này thay vì sửa code
+# ─────────────────────────────────────────────────────────────
 
 project:
-  name: "Vision-Based Phát Hiện Hành Vi Bất Thường"
-  version: "1.0.0"
+  name: "Vision-Based Abnormal Behavior Detection"
+  version: "2.0.0"
 
-device: "cpu"          # "cpu" | "cuda" | "mps"
+device: "cpu"   # "cpu" | "cuda" | "mps"
 seed: 42
 
-# ── Paths ─────────────────────────────────────
+# ── Đường dẫn ────────────────────────────────────────────────
 paths:
   data_raw:        "data/raw"
+  data_labeled:    "data/labeled"
   data_processed:  "data/processed"
-  data_samples:    "data/samples"
   model_weights:   "models/weights"
   output_videos:   "outputs/videos"
-  output_images:   "outputs/images"
   output_reports:  "outputs/reports"
 
-# ── Branch 1: Image Preprocessing ────────────
+# ── Nguồn video / camera ─────────────────────────────────────
+# source: 0               # webcam mặc định
+# source: "data/raw/cctv.mp4"
+# source: "rtsp://192.168.1.100:554/stream"
+source: "data/raw"        # folder chứa video
+
+# ── Nhãn hành vi ─────────────────────────────────────────────
+classes:
+  0: "Normal"
+  1: "Fighting"
+  2: "Falling"
+  3: "Loitering"
+  4: "Crowd Panic"
+
+# ── Branch 1: Tiền xử lý ảnh ────────────────────────────────
 preprocessing:
-  resize: [640, 640]          # [width, height]
+  resize: [640, 640]           # [width, height]
   denoise:
-    method: "gaussian"        # gaussian | median | bilateral | nlm
+    method: "gaussian"         # gaussian | median | bilateral | nlm
     kernel_size: 5
   enhancement:
-    method: "clahe"           # clahe | histogram_eq | gamma
+    method: "clahe"            # clahe | histogram_eq | gamma
     clip_limit: 2.0
     tile_grid: [8, 8]
   sharpen: false
 
-# ── Branch 2: Detection ───────────────────────
+# ── Branch 2: Phát hiện người ────────────────────────────────
 detection:
-  model: "yolov8n"            # yolov8n | yolov8s | yolov8m
+  model: "yolov8n"             # yolov8n | yolov8s  (fallback: hog)
   confidence: 0.45
   iou_threshold: 0.45
-  classes: [0]                # 0 = person (COCO)
   input_size: 640
+  motion_filter: true          # chỉ detect khi có chuyển động
 
-# ── Branch 3: Classification ──────────────────
+# ── Branch 3: Phân loại hành vi ──────────────────────────────
 classification:
-  model: "mobilenet_v3_small"  # mobilenet_v3_small | resnet50 | efficientnet_b0
+  model: "mobilenet_v3_small"  # mobilenet_v3_small | efficientnet_b0 | resnet50
   num_classes: 5
-  class_names:
-    0: "Normal"
-    1: "Fighting"
-    2: "Falling"
-    3: "Loitering"
-    4: "Crowd Panic"
-  confidence_threshold: 0.60
+  confidence_threshold: 0.55
   input_size: [224, 224]
-  # Training hyperparams
-  epochs: 20
+  epochs: 25
   batch_size: 16
-  lr: 0.001
-  weight_decay: 1e-4
+  lr: 0.0005
+  weight_decay: 1.0e-4
 
-# ── Branch 4: Data Augmentation ───────────────
+# ── Branch 4: Augmentation ───────────────────────────────────
 augmentation:
+  n_per_image: 5               # bản sao augment mỗi ảnh gốc
   p_flip: 0.5
-  p_rotate: 0.3
+  p_rotate: 0.35
   max_rotate_deg: 15
   p_brightness: 0.4
   p_blur: 0.2
   p_mixup: 0.3
   mixup_alpha: 0.4
-  use_gan: false             # set true if GAN weights available
 
-# ── Branch 5: Tracking ────────────────────────
+# ── Branch 5: Tracking + Phát hiện bất thường ────────────────
 tracking:
-  max_age: 30                # frames before track deleted
-  min_hits: 3
-  iou_threshold: 0.3
+  max_age: 30                  # frame tối đa mất dấu trước khi xóa track
+  min_hits: 3                  # frame tối thiểu trước khi hiển thị track
+  iou_threshold: 0.30
   optical_flow: true
-  heatmap_decay: 0.97        # accumulation decay factor
-  density_radius: 20         # pixels for density estimation
+  heatmap_decay: 0.97
 
-# ── Anomaly Thresholds ────────────────────────
 anomaly:
-  speed_threshold: 80        # pixels/frame – too fast = suspicious
-  crowd_density_threshold: 5  # persons/zone
-  loiter_frames: 60          # frames stationary = loitering
+  speed_threshold: 80          # pixel/frame – nhanh bất thường
+  loiter_frames: 60            # frame đứng yên = loitering
+  crowd_threshold: 6           # số người / vùng = đám đông
 
-# ── Video / Stream Input ─────────────────────────────────────────────────
-io:
-  # Source examples:
-  #   File:    "data/raw/cctv_scene01.mp4"
-  #   RTSP:    "rtsp://admin:pass@192.168.1.100:554/stream1"
-  #   Webcam:  0   (integer index)
-  source: "data/raw/sample.mp4"
-  resize: null           # [width, height] or null to keep original
-  buffer_size: 4         # threaded frame buffer size (for RTSP/webcam)
-  reconnect_attempts: 3  # reconnect retries for dropped streams
-  reconnect_delay: 2.0   # seconds between reconnects
+# ── Labeling tool ─────────────────────────────────────────────
+labeling:
+  frame_step: 5                # bước nhảy frame mặc định (phím D)
+  save_full_frame: false       # true = lưu cả frame, false = chỉ lưu crop
+  min_crop_size: [32, 32]      # [w, h] – bỏ qua crop quá nhỏ
 
-# ── Dataset Ingest ───────────────────────────────────────────────────────
-ingest:
-  # For static image folders (camera screenshots already sorted by class)
-  src_root: "data/raw_images"    # root with Normal/, Fighting/, ... subfolders
-  out_root: "data/labeled/static"
-  resize: null                   # [width, height] or null
+# ── Dataset builder ───────────────────────────────────────────
+dataset:
+  val_ratio: 0.15
+  test_ratio: 0.10
+  target_per_class: null       # null = không oversample; số nguyên = oversample đến N
+  remove_duplicates: true
+  min_image_size: [32, 32]

@@ -1,299 +1,270 @@
 """
-tools/label_tool.py — Interactive CCTV Video Labeling Tool
-===========================================================
+tools/label_tool.py — Interactive CCTV Video Labeling Tool (OpenCV)
+====================================================================
 
-Lets you scrub through video files, extract frames, and assign
-behavior labels by pressing number keys. Saves labels to JSON
-and extracts cropped images ready for training.
+Mở video lên cửa sổ OpenCV, dùng bàn phím để gán nhãn hành vi
+từng frame và lưu crop ảnh theo class.
 
-Usage:
-    python tools/label_tool.py --video data/raw/scene01.mp4
-    python tools/label_tool.py --video data/raw/scene01.mp4 --step 10
-    python tools/label_tool.py --batch data/raw/          # label all videos in folder
+ĐIỀU KHIỂN:
+    D / SPACE   → Frame tiếp (theo bước --step)
+    A           → Frame trước
+    F           → Toggle fast-forward (5× speed)
+    0 – 4       → Chọn nhãn hành vi
+    S           → Lưu frame/crop hiện tại với nhãn đang chọn
+    Z           → Undo lần lưu gần nhất
+    I           → Info: in thống kê ra terminal
+    Q / ESC     → Thoát và lưu session
 
-Controls (OpenCV window):
-    SPACE / D   → next frame (by --step)
-    A           → previous frame
-    0–4         → assign label  (0=Normal 1=Fighting 2=Falling 3=Loitering 4=Panic)
-    S           → save current frame as labeled crop
-    F           → toggle fast-forward (5x speed)
-    Q / ESC     → quit and save session
-
-Output:
-    data/labeled/<video_stem>/
-        labels.json          ← {frame_idx: label_id}
-        Normal/              ← extracted crops per class
+OUTPUT:
+    data/labeled/<tên_video>/
+        labels.json             ← {frame_idx: label_id}
+        Normal/                 ← ảnh crop theo class
         Fighting/
         Falling/
         Loitering/
         Crowd Panic/
+
+DÙNG:
+    python tools/label_tool.py --video data/raw/cctv.mp4
+    python tools/label_tool.py --video data/raw/cctv.mp4 --step 10 --out data/labeled/
+    python tools/label_tool.py --batch data/raw/            # gán nhãn hàng loạt
 """
 from __future__ import annotations
 import cv2
 import json
 import argparse
 import sys
-import os
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.utils.logger import get_logger
+import src.utils.log as _log
 
-logger = get_logger("label_tool")
+log = _log.get("label_tool")
 
-CLASS_NAMES = {
-    0: "Normal",
-    1: "Fighting",
-    2: "Falling",
-    3: "Loitering",
-    4: "Crowd Panic",
-}
-CLASS_COLORS = {
-    0: (0, 200, 130),
-    1: (0,  50, 220),
-    2: (0, 165, 255),
-    3: (180, 60, 210),
-    4: (0,   0, 220),
-}
+CLASS_NAMES = {0:"Normal", 1:"Fighting", 2:"Falling", 3:"Loitering", 4:"Crowd Panic"}
+COLORS = {0:(0,200,130), 1:(0,50,220), 2:(0,165,255), 3:(180,60,210), 4:(0,0,220)}
 
 
-# ── Core Labeler ──────────────────────────────────────────────────────────
-
-class VideoLabeler:
-    """
-    Interactive per-frame labeling session for a single video.
-
-    Attributes:
-        video_path:   path to input video
-        out_dir:      root output directory for this video
-        step:         frame skip amount per keypress
-        labels:       {frame_idx: label_id}
-    """
+class LabelSession:
+    """Quản lý một phiên gán nhãn cho một video."""
 
     def __init__(self, video_path: str, out_dir: str, step: int = 5):
-        self.video_path = video_path
-        self.out_dir    = Path(out_dir)
-        self.step       = step
+        self.vpath   = Path(video_path)
+        self.out_dir = Path(out_dir)
+        self.step    = step
         self.labels: Dict[int, int] = {}
-        self._load_existing_labels()
+        self._history: List[Tuple[int,int]] = []   # undo stack
 
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps          = self.cap.get(cv2.CAP_PROP_FPS) or 25
-        self.frame_idx    = 0
-        self.current_label: int = 0
-        self._fast_forward = False
-
-        # Create class subdirs
+        # Tạo thư mục output
         for cls_name in CLASS_NAMES.values():
             (self.out_dir / cls_name).mkdir(parents=True, exist_ok=True)
 
-        logger.info(
-            f"VideoLabeler: {video_path} | "
-            f"{self.total_frames} frames @ {self.fps:.1f}fps | "
-            f"step={step}"
-        )
-
-    def _load_existing_labels(self):
+        # Load session cũ nếu có
         label_file = self.out_dir / "labels.json"
         if label_file.exists():
-            with open(label_file) as f:
-                raw = json.load(f)
-            self.labels = {int(k): v for k, v in raw.items()}
-            logger.info(f"Resumed session: {len(self.labels)} labels loaded")
+            with open(label_file, encoding="utf-8") as f:
+                self.labels = {int(k): v for k, v in json.load(f).items()}
+            log.info(f"Tiếp tục session: {len(self.labels)} nhãn đã có")
 
-    def _save_labels(self):
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        label_file = self.out_dir / "labels.json"
-        with open(label_file, "w") as f:
-            json.dump(self.labels, f, indent=2)
-        logger.info(f"Labels saved → {label_file}  ({len(self.labels)} entries)")
+        # Mở video
+        self.cap = cv2.VideoCapture(str(video_path))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Không mở được video: {video_path}")
 
-    def _read_frame(self, idx: int) -> Optional[cv2.Mat]:
+        self.total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps   = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
+        self.idx   = 0
+        self.cur_label = 0
+        self.fast  = False
+
+        log.info(f"Video: {video_path} | {self.total} frames @ {self.fps:.1f}fps | step={step}")
+
+    # ── IO ────────────────────────────────────────────────────────────────────
+
+    def _read(self, idx: int) -> Optional[cv2.Mat]:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = self.cap.read()
-        return frame if ret else None
+        ok, f = self.cap.read()
+        return f if ok else None
 
-    def _draw_ui(self, frame: cv2.Mat) -> cv2.Mat:
-        """Overlay HUD on frame."""
-        h, w = frame.shape[:2]
+    def save_session(self):
+        with open(self.out_dir / "labels.json", "w", encoding="utf-8") as f:
+            json.dump(self.labels, f, indent=2, ensure_ascii=False)
+        log.info(f"Đã lưu {len(self.labels)} nhãn → {self.out_dir/'labels.json'}")
+
+    def save_crop(self, frame: cv2.Mat):
+        cls_name = CLASS_NAMES[self.cur_label]
+        fname    = f"{self.vpath.stem}_f{self.idx:06d}.jpg"
+        path     = self.out_dir / cls_name / fname
+        cv2.imwrite(str(path), frame)
+        self.labels[self.idx] = self.cur_label
+        self._history.append((self.idx, self.cur_label))
+        log.info(f"Crop lưu → {path}")
+
+    def undo(self):
+        if not self._history:
+            return
+        ridx, _ = self._history.pop()
+        if ridx in self.labels:
+            cls_name = CLASS_NAMES[self.labels.pop(ridx)]
+            fname    = f"{self.vpath.stem}_f{ridx:06d}.jpg"
+            fp       = self.out_dir / cls_name / fname
+            if fp.exists(): fp.unlink()
+            log.info(f"Undo: xóa frame {ridx} ({cls_name})")
+
+    # ── HUD ───────────────────────────────────────────────────────────────────
+
+    def _draw_hud(self, frame: cv2.Mat) -> cv2.Mat:
         out = frame.copy()
+        h, w = out.shape[:2]
 
         # Top bar
-        cv2.rectangle(out, (0, 0), (w, 52), (20, 20, 20), -1)
-        ts = f"{int(self.frame_idx / self.fps // 60):02d}:{int(self.frame_idx / self.fps % 60):02d}"
-        cv2.putText(out, f"Frame: {self.frame_idx}/{self.total_frames}  [{ts}]",
-                    (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-        cv2.putText(out, f"Labeled: {len(self.labels)}  |  Fast: {'ON' if self._fast_forward else 'off'}",
-                    (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.rectangle(out, (0,0), (w,54), (18,18,18), -1)
+        ts = f"{int(self.idx/self.fps//60):02d}:{int(self.idx/self.fps%60):02d}"
+        cv2.putText(out, f"Frame {self.idx}/{self.total}  [{ts}]  Labeled:{len(self.labels)}",
+                    (10,18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200,200,200), 1)
+        cv2.putText(out, f"Fast:{'ON' if self.fast else 'off'}  Step:{self.step}",
+                    (10,38), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (150,150,150), 1)
 
         # Progress bar
-        pct = self.frame_idx / max(self.total_frames - 1, 1)
         bar_w = w - 20
-        cv2.rectangle(out, (10, 48), (10 + bar_w, 52), (60, 60, 60), -1)
-        cv2.rectangle(out, (10, 48), (10 + int(bar_w * pct), 52), (0, 200, 130), -1)
+        pct   = self.idx / max(self.total-1, 1)
+        cv2.rectangle(out, (10,50), (10+bar_w,54), (55,55,55), -1)
+        cv2.rectangle(out, (10,50), (10+int(bar_w*pct),54), (0,200,130), -1)
 
-        # Current label badge
-        color = CLASS_COLORS[self.current_label]
-        label_text = f"[{self.current_label}] {CLASS_NAMES[self.current_label]}"
-        (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(out, (w - tw - 20, 8), (w - 4, 8 + th + 8), color, -1)
-        cv2.putText(out, label_text, (w - tw - 12, 8 + th + 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Current label badge (top-right)
+        col  = COLORS[self.cur_label]
+        txt  = f"[{self.cur_label}] {CLASS_NAMES[self.cur_label]}"
+        (tw,th),_ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        cv2.rectangle(out, (w-tw-18, 8), (w-4, 8+th+8), col, -1)
+        cv2.putText(out, txt, (w-tw-10, 8+th+2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
 
-        # Already labeled marker
-        if self.frame_idx in self.labels:
-            lbl = self.labels[self.frame_idx]
-            c = CLASS_COLORS[lbl]
-            cv2.rectangle(out, (0, 0), (6, h), c, -1)
+        # Left stripe: already labeled in this class?
+        if self.idx in self.labels:
+            lbl = self.labels[self.idx]
+            cv2.rectangle(out, (0,0), (6,h), COLORS[lbl], -1)
 
         # Bottom legend
-        legend_y = h - 10
-        for idx, (k, v) in enumerate(CLASS_NAMES.items()):
-            text = f"{k}:{v[:4]}"
-            color_bg = CLASS_COLORS[k]
-            x = 10 + idx * 100
-            cv2.rectangle(out, (x, legend_y - 14), (x + 90, legend_y + 2), color_bg, -1)
-            cv2.putText(out, text, (x + 4, legend_y - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        for i, (k,v) in enumerate(CLASS_NAMES.items()):
+            x = 10 + i*122
+            cv2.rectangle(out, (x, h-28), (x+112, h-6), COLORS[k], -1)
+            cv2.putText(out, f"{k}:{v[:7]}", (x+5, h-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
 
-        # Controls reminder
-        cv2.putText(out, "A/D:prev/next  S:save crop  F:fast  Q:quit",
-                    (10, h - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+        # Controls hint
+        cv2.putText(out, "A/D:prev/next  S:save  Z:undo  F:fast  Q:quit",
+                    (10, h-36), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120,120,120), 1)
         return out
 
-    def _save_crop(self, frame: cv2.Mat):
-        cls_name = CLASS_NAMES[self.current_label]
-        stem = Path(self.video_path).stem
-        fname = f"{stem}_f{self.frame_idx:06d}.jpg"
-        out_path = self.out_dir / cls_name / fname
-        cv2.imwrite(str(out_path), frame)
-        self.labels[self.frame_idx] = self.current_label
-        logger.info(f"Saved crop → {out_path}  label={cls_name}")
+    # ── Main Loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        """Main interactive labeling loop."""
-        win = f"Label Tool — {Path(self.video_path).name}"
+        win = f"Label Tool — {self.vpath.name}"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, 960, 560)
+        cv2.resizeWindow(win, 960, 580)
 
-        frame = self._read_frame(self.frame_idx)
+        frame = self._read(self.idx)
         if frame is None:
-            logger.error("Could not read first frame.")
-            return
+            log.error("Không đọc được frame đầu tiên."); return
 
         while True:
-            display = self._draw_ui(frame)
-            cv2.imshow(win, display)
+            cv2.imshow(win, self._draw_hud(frame))
+            key = cv2.waitKey(1 if self.fast else 20) & 0xFF
 
-            delay = 20 if not self._fast_forward else 1
-            key = cv2.waitKey(delay) & 0xFF
-
-            # ── Key handling ──────────────────────────────────────────────
-            if key in (ord('q'), 27):           # Q / ESC → quit
+            if key in (ord('q'), 27):                      # Quit
                 break
-
-            elif key in (ord('d'), ord(' ')):   # next
-                jump = self.step * (5 if self._fast_forward else 1)
-                self.frame_idx = min(self.frame_idx + jump, self.total_frames - 1)
-                frame = self._read_frame(self.frame_idx)
-
-            elif key == ord('a'):               # prev
-                self.frame_idx = max(self.frame_idx - self.step, 0)
-                frame = self._read_frame(self.frame_idx)
-
-            elif key == ord('s'):               # save crop
-                self._save_crop(frame)
-                cv2.rectangle(display, (0, 0), (display.shape[1], display.shape[0]),
-                              CLASS_COLORS[self.current_label], 8)
-                cv2.imshow(win, display)
-                cv2.waitKey(150)
-
-            elif key == ord('f'):               # toggle fast-forward
-                self._fast_forward = not self._fast_forward
-
-            elif ord('0') <= key <= ord('4'):   # set label
-                self.current_label = key - ord('0')
+            elif key in (ord('d'), ord(' ')):              # Next
+                jump = self.step * (5 if self.fast else 1)
+                self.idx = min(self.idx + jump, self.total - 1)
+                frame = self._read(self.idx)
+            elif key == ord('a'):                          # Prev
+                self.idx = max(self.idx - self.step, 0)
+                frame = self._read(self.idx)
+            elif key == ord('s') and frame is not None:    # Save
+                self.save_crop(frame)
+                # Flash border
+                flash = frame.copy()
+                cv2.rectangle(flash, (0,0), (flash.shape[1],flash.shape[0]),
+                              COLORS[self.cur_label], 12)
+                cv2.imshow(win, self._draw_hud(flash))
+                cv2.waitKey(180)
+            elif key == ord('z'):                          # Undo
+                self.undo()
+            elif key == ord('f'):                          # Fast-forward
+                self.fast = not self.fast
+            elif key == ord('i'):                          # Info
+                self._print_stats()
+            elif ord('0') <= key <= ord('4'):              # Set label
+                self.cur_label = key - ord('0')
 
             if frame is None:
-                logger.warning("End of video or read error.")
-                break
+                log.warning("Hết video hoặc lỗi đọc frame."); break
 
         cv2.destroyAllWindows()
         self.cap.release()
-        self._save_labels()
-        self._print_summary()
+        self.save_session()
+        self._print_stats()
 
-    def _print_summary(self):
-        from collections import Counter
+    def _print_stats(self):
         counts = Counter(self.labels.values())
-        print("\n" + "═" * 45)
-        print(f"  Labeling Summary: {Path(self.video_path).name}")
-        print("═" * 45)
-        for cls_id, cls_name in CLASS_NAMES.items():
-            n = counts.get(cls_id, 0)
-            bar = "█" * min(n, 30)
-            print(f"  {cls_id} {cls_name:<14} {bar:30s} {n}")
-        print(f"  Total labeled: {len(self.labels)}")
-        print("═" * 45 + "\n")
+        print("\n" + "─"*48)
+        print(f"  {self.vpath.name}  |  {len(self.labels)} frames gán nhãn")
+        print("─"*48)
+        for cid, cname in CLASS_NAMES.items():
+            n   = counts.get(cid, 0)
+            bar = "█" * min(n, 32)
+            print(f"  {cid} {cname:<14} {bar:<32} {n:4d}")
+        print("─"*48 + "\n")
 
-    def export_dataset_stats(self) -> Dict:
-        from collections import Counter
+    def summary(self) -> Dict:
         counts = Counter(self.labels.values())
         return {
-            "video": str(self.video_path),
-            "total_frames": self.total_frames,
+            "video":         str(self.vpath),
+            "total_frames":  self.total,
             "labeled_frames": len(self.labels),
-            "class_counts": {CLASS_NAMES[k]: v for k, v in counts.items()},
-            "label_file": str(self.out_dir / "labels.json"),
+            "class_counts":  {CLASS_NAMES[k]: v for k, v in counts.items()},
         }
 
 
-# ── Batch Labeler ─────────────────────────────────────────────────────────
-
-def batch_label(folder: str, step: int = 5):
-    """Label all MP4/AVI videos in a folder sequentially."""
+def batch_label(folder: str, step: int = 5, out_root: str = "data/labeled"):
+    """Gán nhãn lần lượt tất cả video trong folder."""
     folder = Path(folder)
-    videos = sorted(folder.glob("*.mp4")) + sorted(folder.glob("*.avi"))
+    videos = sorted(folder.glob("*.mp4")) + sorted(folder.glob("*.avi")) + \
+             sorted(folder.glob("*.MP4")) + sorted(folder.glob("*.AVI"))
     if not videos:
-        print(f"No MP4/AVI files found in {folder}")
-        return
+        print(f"Không tìm thấy video MP4/AVI trong {folder}"); return
 
-    print(f"Found {len(videos)} videos to label.\n")
-    for i, v in enumerate(videos):
-        print(f"\n[{i+1}/{len(videos)}] {v.name}")
-        out_dir = folder.parent / "labeled" / v.stem
-        labeler = VideoLabeler(str(v), str(out_dir), step=step)
-        labeler.run()
+    print(f"Tìm thấy {len(videos)} video cần gán nhãn.\n")
+    for i, v in enumerate(videos, 1):
+        print(f"\n[{i}/{len(videos)}] {v.name}")
+        out = Path(out_root) / v.stem
+        sess = LabelSession(str(v), str(out), step=step)
+        sess.run()
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive CCTV Video Labeling Tool",
+        description="CCTV Video Labeling Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--video",  type=str, help="Single video file to label")
-    parser.add_argument("--batch",  type=str, help="Folder containing videos to label")
-    parser.add_argument("--step",   type=int, default=5,
-                        help="Frame step per keypress (default: 5)")
-    parser.add_argument("--out",    type=str, default=None,
-                        help="Output directory (default: data/labeled/<video_stem>)")
+    parser.add_argument("--video", type=str, default=None, help="Một file video")
+    parser.add_argument("--batch", type=str, default=None, help="Thư mục chứa nhiều video")
+    parser.add_argument("--step",  type=int, default=5,   help="Bước frame (default: 5)")
+    parser.add_argument("--out",   type=str, default=None,help="Thư mục output")
     args = parser.parse_args()
 
     if args.video:
-        out_dir = args.out or f"data/labeled/{Path(args.video).stem}"
-        labeler = VideoLabeler(args.video, out_dir, step=args.step)
-        labeler.run()
+        stem = Path(args.video).stem
+        out  = args.out or f"data/labeled/{stem}"
+        LabelSession(args.video, out, step=args.step).run()
     elif args.batch:
-        batch_label(args.batch, step=args.step)
+        batch_label(args.batch, step=args.step,
+                    out_root=args.out or "data/labeled")
     else:
         parser.print_help()
 
@@ -302,156 +273,141 @@ if __name__ == "__main__":
     main()
 
 
-# ── Image Folder Labeler ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# AI-Assisted Label Session (gợi ý nhãn tự động, người xác nhận)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class ImageFolderLabeler:
+class AIAssistedSession(LabelSession):
     """
-    Label a folder of static images (JPG/PNG) — for cameras that save
-    individual frames instead of video files.
+    Mở rộng LabelSession: AI tự động dự đoán nhãn trước,
+    hiển thị gợi ý trên màn hình, người dùng nhấn ENTER
+    để chấp nhận hoặc 0-4 để sửa.
 
-    Controls (OpenCV window):
-        D / SPACE   → next image
-        A           → previous image
-        0–4         → assign label
-        S           → move image to labeled/<class>/ folder
-        Q / ESC     → quit and save
+    So với gán tay hoàn toàn:
+        - Không cần bấm 0-4 cho frame rõ ràng
+        - Chỉ cần sửa khi AI đoán sai
+        - Tăng tốc độ gán nhãn ~3-5x
 
-    Output:
-        data/labeled/<folder_name>/
-            Normal/   Fighting/   Falling/   Loitering/   Crowd Panic/
-            labels.json
+    Phím bổ sung:
+        ENTER / S   → Chấp nhận gợi ý của AI và lưu
+        0–4         → Ghi đè nhãn và lưu
     """
 
-    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+    def __init__(self, video_path: str, out_dir: str,
+                 step: int = 5, cfg=None):
+        super().__init__(video_path, out_dir, step)
+        self._ai_label: Optional[int] = None
+        self._ai_conf:  float = 0.0
+        self._predictor = None
+        if cfg is not None:
+            self._init_predictor(cfg)
 
-    def __init__(self, folder: str, out_dir: str):
-        self.folder  = Path(folder)
-        self.out_dir = Path(out_dir)
-        self.images  = sorted([
-            p for p in self.folder.iterdir()
-            if p.suffix.lower() in self.IMG_EXTS
-        ])
-        if not self.images:
-            raise RuntimeError(f"No images found in {folder}")
+    def _init_predictor(self, cfg):
+        try:
+            from src.autolabel.autolabeler import AutoLabeler
+            al = AutoLabeler.from_config(cfg, mode="auto")
+            self._predictor = al._predict
+            log.info(f"AI Assist: mode={al._mode}")
+        except Exception as e:
+            log.warning(f"AI Assist không khởi động được: {e}")
 
-        self.labels: Dict[str, int] = {}
-        self.current_label = 0
-        self.idx = 0
+    def _ai_predict(self, frame: cv2.Mat):
+        """Chạy AI prediction trên frame hiện tại."""
+        if self._predictor is None:
+            return
+        try:
+            from src.detection.detector import PersonDetector
+            # Quick HOG detect để lấy crop
+            import cv2 as _cv2
+            hog = _cv2.HOGDescriptor()
+            hog.setSVMDetector(_cv2.HOGDescriptor_getDefaultPeopleDetector())
+            gray = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
+            rects, weights = hog.detectMultiScale(gray, winStride=(16,16), scale=1.1)
+            if len(rects) > 0:
+                best_idx = int(np.argmax(weights))
+                x,y,w,h = rects[best_idx]
+                crop = frame[y:y+h, x:x+w]
+            else:
+                crop = frame
 
-        for cls_name in CLASS_NAMES.values():
-            (self.out_dir / cls_name).mkdir(parents=True, exist_ok=True)
+            if crop.size > 0:
+                self._ai_label, self._ai_conf = self._predictor(crop)
+                self.cur_label = self._ai_label
+        except Exception as e:
+            log.debug(f"AI predict error: {e}")
 
-        logger.info(f"ImageFolderLabeler: {len(self.images)} images in {folder}")
-
-    def _save_labels(self):
-        with open(self.out_dir / "labels.json", "w") as f:
-            json.dump(self.labels, f, indent=2)
-
-    def _draw_ui(self, frame: cv2.Mat, img_path: Path) -> cv2.Mat:
-        out = frame.copy()
-        h, w = out.shape[:2]
-        cv2.rectangle(out, (0, 0), (w, 46), (20, 20, 20), -1)
-        cv2.putText(out, f"{self.idx+1}/{len(self.images)}  {img_path.name}",
-                    (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200,200,200), 1)
-        cv2.putText(out, f"Labeled: {len(self.labels)}",
-                    (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200,200,200), 1)
-        # Label badge
-        color = CLASS_COLORS[self.current_label]
-        text  = f"[{self.current_label}] {CLASS_NAMES[self.current_label]}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(out, (w-tw-20, 8), (w-4, 8+th+8), color, -1)
-        cv2.putText(out, text, (w-tw-12, 8+th+2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        # Already labeled marker
-        fname = img_path.name
-        if fname in self.labels:
-            lbl_id = self.labels[fname]
-            cv2.rectangle(out, (0, 0), (6, h), CLASS_COLORS[lbl_id], -1)
-        # Bottom hint
-        cv2.putText(out, "A/D:prev/next  S:save  0-4:label  Q:quit",
-                    (10, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150,150,150), 1)
+    def _draw_hud(self, frame: cv2.Mat) -> cv2.Mat:
+        out = super()._draw_hud(frame)
+        # Thêm AI suggestion bar
+        if self._ai_label is not None:
+            h, w = out.shape[:2]
+            col  = COLORS[self._ai_label]
+            conf_color = (0, 220, 100) if self._ai_conf >= 0.75 else \
+                         (0, 165, 255) if self._ai_conf >= 0.55 else (100, 100, 200)
+            txt = (f"🤖 AI: {CLASS_NAMES[self._ai_label]} "
+                   f"({self._ai_conf*100:.0f}%)  "
+                   f"{'← ENTER để chấp nhận' if self._ai_conf >= 0.55 else '← conf thấp, hãy kiểm tra'}")
+            cv2.rectangle(out, (0, h//2-24), (w, h//2+8), (20,20,20), -1)
+            cv2.putText(out, txt, (10, h//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                        conf_color, 1, cv2.LINE_AA)
         return out
 
     def run(self):
-        win = f"Image Labeler — {self.folder.name}"
+        """Override để thêm AI prediction và ENTER key."""
+        win = f"AI-Assisted Label — {self.vpath.name}"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, 900, 520)
+        cv2.resizeWindow(win, 980, 600)
+
+        frame = self._read(self.idx)
+        if frame is None:
+            log.error("Không đọc được frame đầu tiên."); return
+
+        self._ai_predict(frame)   # predict frame đầu tiên
 
         while True:
-            img_path = self.images[self.idx]
-            frame    = cv2.imread(str(img_path))
-            if frame is None:
-                logger.warning(f"Cannot read {img_path}")
-                self.idx = min(self.idx + 1, len(self.images) - 1)
-                continue
-
-            display = self._draw_ui(frame, img_path)
-            cv2.imshow(win, display)
-            key = cv2.waitKey(0) & 0xFF
+            cv2.imshow(win, self._draw_hud(frame))
+            key = cv2.waitKey(25) & 0xFF
 
             if key in (ord('q'), 27):
                 break
             elif key in (ord('d'), ord(' ')):
-                self.idx = min(self.idx + 1, len(self.images) - 1)
+                jump = self.step * (5 if self.fast else 1)
+                self.idx = min(self.idx + jump, self.total - 1)
+                frame = self._read(self.idx)
+                self._ai_predict(frame)
             elif key == ord('a'):
-                self.idx = max(self.idx - 1, 0)
+                self.idx = max(self.idx - self.step, 0)
+                frame = self._read(self.idx)
+                self._ai_predict(frame)
+            elif key in (13, ord('s')):       # ENTER hoặc S → chấp nhận AI
+                if self._ai_label is not None:
+                    self.cur_label = self._ai_label
+                self.save_crop(frame)
+                flash = frame.copy()
+                cv2.rectangle(flash, (0,0), (flash.shape[1],flash.shape[0]),
+                              COLORS[self.cur_label], 12)
+                cv2.imshow(win, self._draw_hud(flash))
+                cv2.waitKey(150)
+            elif key == ord('z'):
+                self.undo()
+            elif key == ord('f'):
+                self.fast = not self.fast
+            elif key == ord('i'):
+                self._print_stats()
             elif ord('0') <= key <= ord('4'):
-                self.current_label = key - ord('0')
-            elif key == ord('s'):
-                cls_name = CLASS_NAMES[self.current_label]
-                dst      = self.out_dir / cls_name / img_path.name
-                import shutil
-                shutil.copy2(img_path, dst)
-                self.labels[img_path.name] = self.current_label
-                logger.info(f"Saved {img_path.name} → {cls_name}")
-                # Flash green border
-                flash = display.copy()
-                cv2.rectangle(flash, (0,0), (flash.shape[1], flash.shape[0]),
-                              CLASS_COLORS[self.current_label], 10)
-                cv2.imshow(win, flash)
-                cv2.waitKey(120)
-                # Auto-advance
-                self.idx = min(self.idx + 1, len(self.images) - 1)
+                self.cur_label = key - ord('0')
+                self.save_crop(frame)   # sửa nhãn → lưu luôn
+                flash = frame.copy()
+                cv2.rectangle(flash, (0,0), (flash.shape[1],flash.shape[0]),
+                              COLORS[self.cur_label], 12)
+                cv2.imshow(win, self._draw_hud(flash))
+                cv2.waitKey(150)
+
+            if frame is None:
+                break
 
         cv2.destroyAllWindows()
-        self._save_labels()
-        from collections import Counter
-        counts = Counter(self.labels.values())
-        print(f"\nLabeled {len(self.labels)}/{len(self.images)} images")
-        for cid, cname in CLASS_NAMES.items():
-            print(f"  {cname:<14} {counts.get(cid,0)}")
-
-
-def smart_label(path: str, step: int = 5, out_dir: str = None):
-    """
-    Auto-detect input type and launch the right labeler:
-      - folder of images  → ImageFolderLabeler
-      - video file        → VideoLabeler
-      - folder of videos  → batch VideoLabeler
-    """
-    p = Path(path)
-    IMG_EXTS = {".jpg",".jpeg",".png",".bmp",".tiff"}
-    VID_EXTS = {".mp4",".avi",".mov",".mkv",".ts"}
-
-    if p.is_dir():
-        # Check if it contains images or videos
-        imgs   = [f for f in p.iterdir() if f.suffix.lower() in IMG_EXTS]
-        videos = [f for f in p.iterdir() if f.suffix.lower() in VID_EXTS]
-        if imgs and not videos:
-            od = out_dir or f"data/labeled/{p.name}"
-            ImageFolderLabeler(str(p), od).run()
-        elif videos:
-            batch_label(str(p), step=step)
-        else:
-            print(f"No images or videos found in {p}")
-    elif p.is_file():
-        if p.suffix.lower() in VID_EXTS:
-            od = out_dir or f"data/labeled/{p.stem}"
-            VideoLabeler(str(p), od, step=step).run()
-        elif p.suffix.lower() in IMG_EXTS:
-            od = out_dir or f"data/labeled/{p.parent.name}"
-            ImageFolderLabeler(str(p.parent), od).run()
-        else:
-            print(f"Unsupported file type: {p.suffix}")
-    else:
-        print(f"Path not found: {path}")
+        self.cap.release()
+        self.save_session()
+        self._print_stats()
